@@ -1521,14 +1521,22 @@ def _count_new_note(root: Path, ns_dir: Path, size: int, delta: int) -> None:
         _write_note_count(ns_dir, max(0, ns_count + delta), max(0, ns_used + size * delta))
 
 
-def _at_capacity(cap: int, what: str) -> StoreError:
-    """The refusal, in one place because two callers raise it (rooms count both a cap and a
-    byte budget). Only *new* names are refused, which is the actionable half: an agent
-    blocked here can always keep working in a room or note it is already using."""
+def _at_capacity(cap: int, what: str, where: str) -> StoreError:
+    """The refusal, in one place because two callers raise it: the room count and a
+    per-namespace note count. Only *new* names are refused, which is the actionable half: an agent
+    blocked here can always keep working in a room or note it is already using.
+
+    `where` is the path that answers "what exists" for the cap that was hit. It is a
+    parameter because it is not the same path for all of them. A room refusal points at
+    `/rooms`. A per-namespace note refusal has to point at `/kv/<ns>`: the note figures in
+    `/rooms` are the global aggregate, deliberately blind to namespaces (see `note_stats`),
+    so they cannot show the count that is full and will usually show plenty of headroom
+    while this namespace is at its cap.
+    """
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
         f"Existing {what}s still accept writes, so reuse one you already have — "
-        f"GET /rooms shows what exists. Idle {what}s are reclaimed after 7 days "
+        f"GET {where} shows what exists. Idle {what}s are reclaimed after 7 days "
         "(a room still on its first message goes after 24 hours)."
     )
 
@@ -1581,7 +1589,7 @@ def _check_room_capacity(root: Path, path: Path) -> None:
     # service. `_scan` recurses, so this is the whole tree either way.
     count, used = _scan(root / "rooms", ".jsonl", sized=True)
     if count >= MAX_ROOMS:
-        raise _at_capacity(MAX_ROOMS, "room")
+        raise _at_capacity(MAX_ROOMS, "room", "/rooms")
     if used >= MAX_TOTAL_ROOM_BYTES:
         raise StoreError(
             f"room storage is full ({used >> 20} MiB of a {MAX_TOTAL_ROOM_BYTES >> 20} MiB "
@@ -1628,7 +1636,12 @@ def _check_note_capacity(root: Path, ns_dir: Path, path: Path) -> None:
     # key's bucket now, and counting that would both compare the cap against ~1 note and drop
     # the namespace's `.notes-count` two levels below where every other reader looks for it.
     if _note_totals(ns_dir, _ns_totals, persist=True)[0] >= MAX_NOTES_PER_NS:
-        raise _at_capacity(MAX_NOTES_PER_NS, "note")
+        # The per-namespace refusal names this namespace, not /rooms: the /rooms note figures
+        # are the global aggregate and are blind to namespaces by design (see note_stats), so
+        # /rooms is the one surface that cannot show the count that is full. /kv/<ns> lists
+        # exactly the notes this cap counts. `ns_dir.name` is that namespace; since sharding
+        # `path.parent` is only the key's bucket, so the name has to come off `ns_dir`.
+        raise _at_capacity(MAX_NOTES_PER_NS, "note", f"/kv/{ns_dir.name}")
     _check_note_total(root)
 
 
