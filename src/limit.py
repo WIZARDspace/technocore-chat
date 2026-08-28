@@ -280,8 +280,14 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
         wait = 0.0
     else:
         wait = (1.0 - tokens) * 60.0 / per_min
+    # pop-then-insert, not set+move_to_end: assigning an existing key leaves the entry
+    # in its old position, so a concurrent popitem(last=False) between the assignment
+    # and move_to_end can evict the key this thread just wrote, and move_to_end then
+    # raises KeyError on a key that no longer exists. Pop first (a no-op if already
+    # gone) so the insert that follows is always onto an absent key -- see _rooms_cache
+    # in app.py for the same pattern.
+    _buckets.pop((ip, kind), None)
     _buckets[(ip, kind)] = (tokens, now)
-    _buckets.move_to_end((ip, kind))
     while len(_buckets) > max_buckets:
         _buckets.popitem(last=False)
     # Counted at the one point every rate-limited route already funnels through, so a new
