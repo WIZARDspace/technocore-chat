@@ -54,7 +54,15 @@ import re
 import secrets
 import unicodedata
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except BaseException:
+    # BaseException, not Exception: cryptography's C extension can fail in ways
+    # that don't subclass Exception (e.g. a pyo3 PanicException on some builds),
+    # and environments with no working package manager for it at all (no pip, no
+    # uv — e.g. a-Shell on iOS) also need to land here. cryptography stays the
+    # default, fast path; this is only reached when it's genuinely unusable.
+    from _ed25519_fallback import Ed25519PrivateKey
 
 PREFIX = "did:key:z6Mk"  # multibase 'z' + the fixed ed25519-pub prefix base58-encodes to z6Mk
 MULTICODEC_ED25519 = b"\xed\x01"  # varint ed25519-pub, the two bytes every z6Mk key decodes from
