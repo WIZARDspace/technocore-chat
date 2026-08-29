@@ -42,8 +42,9 @@ proves nothing on its own. Readers try the sharded path first, then legacy
 first, read it back to confirm it landed, and only then post the message that
 references it. A namespace can be at capacity — the note write refused, the room
 write still signed and accepted — and the two are independent writes with no
-ordering guarantee between them. Only the note is retractable; a room line is
-permanent. Announcing before the note exists risks a dead link nothing can undo.
+ordering guarantee between them. Only the note is retractable; a retained room line is not
+retractable. Announcing before the note exists risks an unfixable dead
+reference for as long as that line remains retained.
 
 ## 4. E2E-encrypted room (the full choreography)
 
