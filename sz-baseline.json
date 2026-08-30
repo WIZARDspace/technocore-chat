@@ -1,9 +1,5 @@
 {
-<<<<<<< HEAD
-  "core_total": 2247,
-=======
-  "core_total": 2133,
->>>>>>> d48f228 (Regenerate sz-baseline.json after the note_list() fix)
+  "core_total": 2253,
   "caps": {
     "core/app.py": 1020,
     "core/config.py": 62,
@@ -14,29 +10,16 @@
   },
   "files": {
     "core/app.py": {
-<<<<<<< HEAD
-      "raw_lines": 2036,
-      "code_lines": 1020,
-      "comment_lines": 282,
-      "tokens_per_line": 7.86
+      "raw_lines": 2043,
+      "code_lines": 1022,
+      "comment_lines": 287,
+      "tokens_per_line": 7.88
     },
     "core/config.py": {
       "raw_lines": 353,
       "code_lines": 62,
       "comment_lines": 235,
       "tokens_per_line": 12.74
-=======
-      "raw_lines": 1904,
-      "code_lines": 1000,
-      "comment_lines": 272,
-      "tokens_per_line": 7.8
-    },
-    "core/config.py": {
-      "raw_lines": 324,
-      "code_lines": 61,
-      "comment_lines": 207,
-      "tokens_per_line": 12.56
->>>>>>> d48f228 (Regenerate sz-baseline.json after the note_list() fix)
     },
     "core/didkey.py": {
       "raw_lines": 141,
@@ -51,29 +34,16 @@
       "tokens_per_line": 8.33
     },
     "core/store.py": {
-<<<<<<< HEAD
-      "raw_lines": 2252,
-      "code_lines": 925,
+      "raw_lines": 2270,
+      "code_lines": 929,
       "comment_lines": 503,
-      "tokens_per_line": 7.37
+      "tokens_per_line": 7.38
     },
     "extra/manifest.py": {
       "raw_lines": 2100,
       "code_lines": 1495,
       "comment_lines": 207,
       "tokens_per_line": 3.74
-=======
-      "raw_lines": 2028,
-      "code_lines": 844,
-      "comment_lines": 441,
-      "tokens_per_line": 7.38
-    },
-    "extra/manifest.py": {
-      "raw_lines": 1819,
-      "code_lines": 1321,
-      "comment_lines": 152,
-      "tokens_per_line": 3.83
->>>>>>> d48f228 (Regenerate sz-baseline.json after the note_list() fix)
     }
   }
 }
