@@ -1680,9 +1680,10 @@ def note_list(request: Request) -> Response:
         return limit.limited("read", RATE_READ, retry, text=text, max_wait=MAX_WAIT)
     ns = request.path_params["ns"]
     keys = store.list_notes(config.ROOT, ns)
+    stats = store.note_ns_stats(config.ROOT, ns)
     return respond(
         request,
-        {"ns": ns, "keys": keys},
+        {"ns": ns, "keys": keys, **stats},
         "\n".join(f"/kv/{ns}/{k}" for k in keys),
         budget_note("read", left, RATE_READ),
     )

@@ -2246,6 +2246,24 @@ def note_stats(root: Path) -> dict:
     return {"total": total, "bytes": size, **caps}
 
 
+def note_ns_stats(root: Path, ns: str) -> dict:
+    """Per-namespace note count and its capacity, for a namespace the caller already
+    named. Unlike note_stats() (deliberately global-only, see its docstring), this is
+    scoped to one namespace and is not a new enumeration vector: note_list() already
+    returns every key name in `ns` to anyone who can name it, so a count derived from
+    that same listing (len(keys)) tells a caller nothing they could not already compute.
+
+    The reason to serve `total` rather than let a caller compute it (#510): at the
+    sizes where it matters, len(keys) is prohibitively expensive to obtain. A full
+    `notes` namespace lists 131,072 key names to answer one yes/no question, and
+    fetching a listing that large is exactly the shape of request most likely to hit
+    a 503 under load -- serving the count directly avoids that round trip entirely.
+    """
+    ns_dir = _note_ns_dir(root, ns)
+    total, _ = _note_totals(ns_dir, _ns_totals)
+    return {"total": total, "capacity_per_namespace": MAX_NOTES_PER_NS}
+
+
 def list_notes(root: Path, ns: str) -> list[str]:
     keep = _listable.__wrapped__  # not the cache: see _listable
     names = (e.name[: -len(".txt")] for e in _walk(_note_ns_dir(root, ns), ".txt"))

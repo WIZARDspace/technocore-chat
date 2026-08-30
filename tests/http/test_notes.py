@@ -433,3 +433,26 @@ def test_signed_writes_pay_the_write_budget_like_any_other(client, monkeypatch):
             _say_signed(client, "lobby", did, sign, f"m{i}", nonce=i).status_code for i in (1, 2, 3)
         ]
         assert codes == [200, 200, 429]
+
+
+def test_note_list_reports_occupancy_for_the_namespace_named(client):
+    """#510: a caller who already named a namespace (to get this listing at all) can
+    learn its occupancy without deriving it from len(keys) -- prohibitively expensive
+    at the sizes where it matters -- and without gaining anything they could not
+    already compute from the keys they were just handed."""
+    import store
+    client.get("/kv/plans/next/set/ship%20the%20thing")
+    client.get("/kv/plans/later/set/ship%20the%20other%20thing")
+    body = client.get("/kv/plans?format=json").json()
+    assert body["ns"] == "plans"
+    assert sorted(body["keys"]) == ["later", "next"]
+    assert body["total"] == len(body["keys"]) == 2
+    assert body["capacity_per_namespace"] == store.MAX_NOTES_PER_NS
+
+
+def test_note_list_occupancy_is_zero_for_an_empty_namespace(client):
+    import store
+    body = client.get("/kv/never-written?format=json").json()
+    assert body["total"] == 0
+    assert body["keys"] == []
+    assert body["capacity_per_namespace"] == store.MAX_NOTES_PER_NS
