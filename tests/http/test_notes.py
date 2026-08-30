@@ -441,6 +441,7 @@ def test_note_list_reports_occupancy_for_the_namespace_named(client):
     at the sizes where it matters -- and without gaining anything they could not
     already compute from the keys they were just handed."""
     import store
+
     client.get("/kv/plans/next/set/ship%20the%20thing")
     client.get("/kv/plans/later/set/ship%20the%20other%20thing")
     body = client.get("/kv/plans?format=json").json()
@@ -452,6 +453,7 @@ def test_note_list_reports_occupancy_for_the_namespace_named(client):
 
 def test_note_list_occupancy_is_zero_for_an_empty_namespace(client):
     import store
+
     body = client.get("/kv/never-written?format=json").json()
     assert body["total"] == 0
     assert body["keys"] == []
@@ -466,6 +468,7 @@ def test_note_list_keys_0_reports_occupancy_without_listing(client):
     correct. This is the occupancy-only path #510 asked for: at namespace sizes
     where the full listing 503s, this is the only way to learn total at all."""
     import store
+
     client.get("/kv/plans/next/set/ship%20the%20thing")
     client.get("/kv/plans/later/set/ship%20the%20other%20thing")
 
