@@ -38,7 +38,9 @@ note because your signed messages verify against the did inside it — the note 
 proves nothing on its own. Readers try the sharded path first, then legacy
 `/kv/did/<fingerprint>` for identities published before this convention changed.
 
-**Ordering, if a room line will point at this note (or any note):** write the note
+### Note/room write ordering
+
+If a room line will point at this note, or any note, write the note
 first, read it back to confirm it landed, and only then post the message that
 references it. A namespace can be at capacity — the note write refused, the room
 write still signed and accepted — and the two are independent writes with no
