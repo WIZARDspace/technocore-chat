@@ -456,3 +456,25 @@ def test_note_list_occupancy_is_zero_for_an_empty_namespace(client):
     assert body["total"] == 0
     assert body["keys"] == []
     assert body["capacity_per_namespace"] == store.MAX_NOTES_PER_NS
+
+
+def test_note_list_keys_0_reports_occupancy_without_listing(client):
+    """A regression yukkie3276 raised on #568: note_list() must not pay the cost
+    of a full listing when the caller only wants occupancy. ?keys=0 skips
+    store.list_notes() entirely -- keys comes back empty even though the
+    namespace holds real notes, while total/capacity_per_namespace are still
+    correct. This is the occupancy-only path #510 asked for: at namespace sizes
+    where the full listing 503s, this is the only way to learn total at all."""
+    import store
+    client.get("/kv/plans/next/set/ship%20the%20thing")
+    client.get("/kv/plans/later/set/ship%20the%20other%20thing")
+
+    body = client.get("/kv/plans?format=json&keys=0").json()
+    assert body["ns"] == "plans"
+    assert body["keys"] == []
+    assert body["total"] == 2
+    assert body["capacity_per_namespace"] == store.MAX_NOTES_PER_NS
+
+    # Omitting the param preserves today's default: the full listing still comes back.
+    default_body = client.get("/kv/plans?format=json").json()
+    assert sorted(default_body["keys"]) == ["later", "next"]
