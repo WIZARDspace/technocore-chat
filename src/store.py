@@ -1743,16 +1743,18 @@ def _count_new_note(root: Path, ns_dir: Path, size: int, delta: int) -> None:
 
 
 def _at_capacity(cap: int, what: str, where: str) -> StoreError:
-    """The refusal, in one place because two callers raise it: the room count and a
-    per-namespace note count. Only *new* names are refused, which is the actionable half: an agent
+    """The refusal, in one place because two callers raise it (rooms count both a cap and a
+    byte budget). Only *new* names are refused, which is the actionable half: an agent
     blocked here can always keep working in a room or note it is already using.
 
-    `where` is the path that answers "what exists" for the cap that was hit. It is a
-    parameter because it is not the same path for all of them. A room refusal points at
-    `/rooms`. A per-namespace note refusal has to point at `/kv/<ns>`: the note figures in
-    `/rooms` are the global aggregate, deliberately blind to namespaces (see `note_stats`),
-    so they cannot show the count that is full and will usually show plenty of headroom
-    while this namespace is at its cap.
+    `where` is the path that answers "what exists" for the cap that was hit, and it is a
+    parameter because the two caps do not share one. A room refusal points at `/rooms`. The
+    per-namespace note refusal cannot: the note figures there are the global aggregate,
+    blind to namespaces by design (see `note_stats`), so they report the whole store's
+    headroom while the namespace the caller asked for is full. `/rooms` does publish
+    `capacity_per_namespace`, the cap this message already carries, but no per-namespace
+    count to read it against. `/kv/<ns>` lists the namespace being counted, bar its
+    unlisted `p-` keys, which the cap counts and nothing enumerates (see `unlisted`).
     """
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
@@ -1857,11 +1859,9 @@ def _check_note_capacity(root: Path, ns_dir: Path, path: Path) -> None:
     # key's bucket now, and counting that would both compare the cap against ~1 note and drop
     # the namespace's `.notes-count` two levels below where every other reader looks for it.
     if _note_totals(ns_dir, _ns_totals, persist=True)[0] >= MAX_NOTES_PER_NS:
-        # The per-namespace refusal names this namespace, not /rooms: the /rooms note figures
-        # are the global aggregate and are blind to namespaces by design (see note_stats), so
-        # /rooms is the one surface that cannot show the count that is full. /kv/<ns> lists
-        # exactly the notes this cap counts. `ns_dir.name` is that namespace; since sharding
-        # `path.parent` is only the key's bucket, so the name has to come off `ns_dir`.
+        # `ns_dir.name` and not `path.parent.name` for the same sharding reason as above: the
+        # parent is the key's bucket, so it would name `/kv/<2 hex>`. Why this refusal cannot
+        # cite /rooms is in `_at_capacity`.
         raise _at_capacity(MAX_NOTES_PER_NS, "note", f"/kv/{ns_dir.name}")
     _check_note_total(root)
 
