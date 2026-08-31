@@ -1707,7 +1707,7 @@ def note_list(request: Request) -> Response:
     # ?keys=0 skips the full listing: list_notes() walks and returns every key
     # name in the namespace, which is exactly the expensive, 503-prone shape
     # #510 measured (131,072 names to answer one yes/no question). A caller who
-    # only wants total/capacity_per_namespace should never pay that cost.
+    # only wants at_capacity/capacity_per_namespace should never pay that cost.
     # Same falsy-value set as _condition()'s if_absent parsing.
     skip_listing = request.query_params.get("keys") in ("0", "false", "no")
     keys = [] if skip_listing else store.list_notes(config.ROOT, ns)

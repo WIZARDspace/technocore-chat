@@ -2445,21 +2445,27 @@ def note_stats(root: Path) -> dict:
 
 
 def note_ns_stats(root: Path, ns: str) -> dict:
-    """Per-namespace note count and its capacity, for a namespace the caller already
-    named. Unlike note_stats() (deliberately global-only, see its docstring), this is
-    scoped to one namespace and is not a new enumeration vector: note_list() already
-    returns every key name in `ns` to anyone who can name it, so a count derived from
-    that same listing (len(keys)) tells a caller nothing they could not already compute.
+    """Whether a namespace the caller already named is at capacity, and what that
+    capacity is. What #510 actually asked -- "will my next note write be refused?",
+    asked once before an irreversible announcement -- is a yes/no question, never a
+    request for an occupancy figure, so this answers exactly that and nothing wider.
 
-    The reason to serve `total` rather than let a caller compute it (#510): at the
-    sizes where it matters, len(keys) is prohibitively expensive to obtain. A full
-    `notes` namespace lists 131,072 key names to answer one yes/no question, and
-    fetching a listing that large is exactly the shape of request most likely to hit
-    a 503 under load -- serving the count directly avoids that round trip entirely.
+    A raw count was the first design (see PR #568 history) and was retracted: `total`
+    draws from the same physical count `_check_note_capacity` enforces, which counts
+    unlisted `p-` keys that `list_notes` never returns -- a namespace can show
+    `keys=[]` while `total` climbs, an oracle across the one boundary this service
+    otherwise guarantees. `at_capacity` still reflects that same physical count (it
+    has to: predicting whether the *next* write is refused requires exactly the
+    figure refusal itself checks, hidden keys included), but collapses it to one bit
+    that only changes at the cap boundary, rather than a number that changes on every
+    write anyone makes to the namespace. It reveals what a caller could already learn
+    by attempting one write and reading the refusal (`_at_capacity`'s message names
+    the same cap) -- the difference is only that this doesn't require attempting a
+    write to find out.
     """
     ns_dir = _note_ns_dir(root, ns)
     total, _ = _note_totals(ns_dir, _ns_totals)
-    return {"total": total, "capacity_per_namespace": MAX_NOTES_PER_NS}
+    return {"at_capacity": total >= MAX_NOTES_PER_NS, "capacity_per_namespace": MAX_NOTES_PER_NS}
 
 
 def list_notes(root: Path, ns: str) -> list[str]:
