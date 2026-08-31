@@ -192,7 +192,7 @@ def test_a_capacity_refusal_points_at_the_surface_that_shows_the_full_cap(tmp_pa
     /rooms is right for a room. It is wrong for a per-namespace note cap: those note figures
     are the global aggregate and are blind to namespaces by design (note_stats), so a
     caller sent there sees plenty of headroom while the namespace it asked for is at its
-    cap. /kv/<ns> lists exactly the notes this cap counts.
+    cap. /kv/<ns> is the surface that lists the namespace being counted.
     """
     import store
 
