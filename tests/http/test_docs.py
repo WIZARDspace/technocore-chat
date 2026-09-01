@@ -87,6 +87,99 @@ def test_the_served_manual_states_the_caps_it_actually_enforces(client):
     assert "at most 512 rooms" not in manual and "4096 notes" not in manual
 
 
+def test_the_manual_template_hardcodes_no_constant_it_could_render(client):
+    """The generalisation of the two tests around this one, and the reason they can stop
+    being written one cap at a time.
+
+    Both of those exist because prose drifted from a constant, and each was fixed by
+    tokenising the one number that had already gone wrong. That leaves every *other*
+    number in the template waiting its turn — the manual restated the name grammar, both
+    character caps, the limit bound and default, the topic preview, the ephemeral TTL, the
+    nonce scan window and the reap ages, none of them generated, all of them stated to
+    agents as the complete protocol.
+
+    So this asserts the property rather than the instances: for each constant the renderer
+    knows how to substitute, its literal value must not appear in the *template*. Adding a
+    knob and writing its value into the prose fails here, at the commit that does it,
+    instead of at the release that moves the knob.
+
+    The template, not the rendered document: the rendered one is *supposed* to contain
+    every one of these. That is the point of rendering it.
+    """
+    import app as app_module
+    import store
+
+    # Value -> the token that should be carrying it. Only unambiguous literals: a bare
+    # `50` or `200` matches a byte count or an HTTP status somewhere in the prose, so
+    # those are checked in the phrases the manual actually uses them in.
+    forbidden = {
+        store.NAME_RE.pattern: "__NAME_RULE__",
+        str(store.MAX_TEXT_CHARS): "__MAX_TEXT__",
+        str(store.MAX_VALUE_CHARS): "__MAX_VALUE__",
+        f"1..{store.MAX_LIMIT}": "__MAX_LIMIT__",
+        f"last {store.DEFAULT_LIMIT} messages": "__DEFAULT_LIMIT__",
+        f"previews {store.TOPIC_PREVIEW_CHARS}": "__TOPIC_PREVIEW__",
+        ", ".join(store.INVISIBLE_CATEGORIES[:2]): "__SWEEP_CATEGORIES__",
+    }
+    template = app_module._MANUAL_TEMPLATE
+    for literal, token in forbidden.items():
+        assert literal not in template, (
+            f"manual.md hardcodes {literal!r}; use {token} so it is rendered from the constant"
+        )
+        assert token in template, f"{token} is substituted but no longer used in manual.md"
+
+    # And the substitution is exhaustive: no token survives into what agents are served.
+    assert "__" not in app_module.MANUAL
+
+
+def test_the_manual_states_a_rendered_knob_as_this_instances_value_not_the_default(client):
+    """Rendering a per-deployment knob changes what the prose around it may claim.
+
+    The EPHEMERAL paragraph read "__EPHEMERAL_TTL__ by default". That was true while the
+    figure was the software default typed into the file; once it renders from
+    `store.EPHEMERAL_TTL_SECONDS`, an instance configured to an hour serves "1 hour by
+    default" — false about the default, and contradicting the very next clause, which says
+    the enforced value is published elsewhere rather than fixed here.
+
+    So a rendered knob must be labelled as *this instance's* value. Asserted against a
+    changed TTL, because at the default the wrong wording and the right one read alike.
+    """
+    import app as app_module
+    import config
+
+    with config.override(EPHEMERAL_TTL_SECONDS=3600):
+        manual = app_module._render_manual()
+    section = manual.split("EPHEMERAL:", 1)[1].split("\n\n", 1)[0]
+    assert "1 hour" in section, section
+    assert "by default" not in section, "a rendered per-deployment knob is not the default"
+    assert "THIS instance enforces" in section
+    # And the JSON copy is still named, since that is what a machine reads.
+    assert "limits.ephemeral_ttl_seconds" in section
+
+
+def test_the_manual_renders_durations_and_sets_from_the_constants(client):
+    """The two helpers that let prose name a set or a period without restating it.
+
+    `_english_list` is why "Cc, Cf, Cs, Co, Zl and Zp" cannot say five when the sweep does
+    six; `_duration` is why the ephemeral TTL reads as "15 minutes" without 900 being
+    written anywhere but the knob. Both are asserted against a *changed* value, because an
+    identity-looking helper passes every test at the default and none off it.
+    """
+    import manifest
+
+    assert manifest._english_list(("Cc", "Cf", "Cs")) == "Cc, Cf and Cs"
+    assert manifest._english_list(("Cc", "Cf")) == "Cc and Cf"
+    assert manifest._english_list(("Cc",)) == "Cc"
+    assert manifest._english_list(()) == ""
+
+    assert manifest._duration(900) == "15 minutes"
+    assert manifest._duration(60) == "1 minute"
+    assert manifest._duration(3600) == "1 hour"
+    assert manifest._duration(7 * 86400) == "7 days"
+    # Not a whole unit: an exact second count beats a rounded one an operator cannot check.
+    assert manifest._duration(90) == "90 seconds"
+
+
 def test_the_manual_names_every_category_the_sweep_actually_takes(client):
     """The same drift the caps test guards, on the sweep (#171).
 
@@ -211,6 +304,20 @@ def test_fmt_bytes_renders_a_floor_without_ever_overstating_it(client):
     assert manifest.fmt_bytes(512) == "512 B" and manifest.fmt_bytes(0) == "0 B"
 
 
+def test_public_base_rejects_a_host_that_matches_only_before_a_trailing_newline(client):
+    """`_HOST_RE` is the control that stops an attacker-controlled Host header from steering
+    the absolute URLs the documents advertise — `servers[0].url` in /openapi.json, every
+    `_url(base, …)` in /.well-known/agent.json, the sitemap `<loc>` values, security.txt's
+    `Canonical:` line and the `Link` header. `re.match` lets `$` match *before* a trailing
+    newline, so `"example.com\\n"` passed the gate and rode into `base` verbatim — a control
+    character that breaks strict JSON/XML consumers and shapes a header split. `fullmatch` is
+    the lesson `store.valid_name` already learned for its own allowlist."""
+    import manifest
+
+    assert manifest.public_base("https", "example.com") == "https://example.com"
+    assert manifest.public_base("https", "example.com\n") == ""
+
+
 def test_the_room_budget_is_published_where_agents_look(client):
     import app as app_module
     import store
@@ -241,6 +348,52 @@ def test_robots_keeps_rooms_out_of_indexes_but_invites_the_manual(client):
     assert "Disallow: /r/" in body and "Disallow: /kv/" in body
     assert "Allow: /" in body and "/llms.txt" in body
     assert client.get("/r/lobby").headers["x-robots-tag"] == "noindex"
+
+
+def test_the_skill_states_only_constants_it_can_keep_true(client):
+    """SKILL.md cannot be rendered, so it needs the guard the manual does not.
+
+    Every other served document interpolates its numbers (`app._render_manual`), but this
+    one is published byte-for-byte with a SHA-256 in
+    /.well-known/agent-skills/index.json — the installable file and the served one are one
+    artifact, deliberately, so substituting into it would break the digest that makes
+    "read <host>/skill.md and follow it" checkable. A test is therefore the only thing
+    that can hold its numbers to the code.
+
+    Two rules, and the split is what matters. A *code constant* may be stated: it moves
+    only with a release, and the skill ships with the release. A *per-deployment knob* may
+    not, because this file is byte-identical on every instance and the knob is not — it
+    has to name where the enforced value is published instead.
+
+    The unit is part of the claim: the note cap is code points, and a note of 4-byte
+    characters is four times the byte figure. Saying "8 KiB" was wrong twice over.
+    """
+    import store
+
+    skill = client.get("/skill.md").text
+
+    # Code constants, stated: these are true wherever this file is served.
+    assert store.NAME_RE.pattern in skill
+    assert f"Messages ≤ {store.MAX_TEXT_CHARS} chars" in skill
+    assert f"notes ≤ {store.MAX_VALUE_CHARS} chars" in skill
+    assert "characters,\nnot bytes" in skill, "the note cap is code points; the unit must say so"
+    for category in store.INVISIBLE_CATEGORIES:
+        assert f"`{category}`" in skill, (
+            f"the skill does not name {category}, which the sweep takes"
+        )
+
+    # A figure for a document that grows: the skill said "(~15 KB)" against a manual that
+    # is 22 KB and moves with every release, and being byte-pinned it can never catch up.
+    # Nothing here should state a size it cannot measure (#364).
+    assert "KB)" not in skill, "the skill cannot keep a size for a document it does not own"
+
+    # Per-deployment knobs, not stated as fact: the skill points at the published value.
+    assert "limits.long_poll_seconds" in skill
+    assert "one request per 10 seconds" not in skill, (
+        "CHAT_MAX_WAIT is per deployment; a byte-pinned file cannot assert its value"
+    )
+    # The regression this replaces: a byte figure for a character cap.
+    assert "8 KiB" not in skill
 
 
 def test_skill_md_is_the_installable_skill_and_is_never_rate_limited(client, monkeypatch):
@@ -1273,6 +1426,11 @@ def test_every_sitemap_url_is_one_the_crawler_is_allowed_to_index(client):
     than a room, but what it lists is anonymous and non-durable, so it stays out."""
     import manifest
 
+    assert {
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/mcp/server-card.json",
+    } <= set(manifest.SITEMAP_PATHS)
     for path in manifest.SITEMAP_PATHS:
         response = client.get(path)
         assert response.status_code == 200, f"{path} is listed but not served"
@@ -1443,10 +1601,59 @@ def test_the_static_documents_are_edge_cacheable_and_the_header_is_exact(client)
     assert client.get("/").headers["cache-control"] == static
 
     documents = ("/", "/llms.txt", "/skill.md", "/patterns.md", "/interop.md", "/auth.md")
-    for path in (*documents, "/robots.txt", "/.well-known/security.txt"):
+    # The JSON documents carry the same policy and are listed here rather than left to a
+    # separate test, because "which paths may the edge hold" is one question. They used to
+    # carry a hardcoded `max-age=3600` instead — a client-side hour on documents whose whole
+    # purpose is being refetched — and nothing named them, which is how the two policies
+    # drifted apart unnoticed. /sitemap.xml is in the list for the same reason.
+    machine_readable = (
+        "/openapi.json",
+        "/config",
+        "/sitemap.xml",
+        "/.well-known/agent.json",
+        "/.well-known/api-catalog",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/mcp/server-card.json",
+    )
+    for path in (*documents, *machine_readable, "/robots.txt", "/.well-known/security.txt"):
         cc = client.get(path).headers["cache-control"]
-        assert "s-maxage=" in cc, path
+        assert cc == static, path
         assert "no-store" not in cc, path
+
+
+def test_a_zero_window_means_not_cached_rather_than_cached_without_a_bound(client):
+    """`0` disables, and disabling has to fail closed.
+
+    `_edge_cacheable` sets a header only for a truthy window, so with the knob at zero it
+    returns the response exactly as built. That makes the *initial* header the contract for
+    the disabled case: `text()` starts every response `no-store`, so the prose documents
+    fall back to it, and a bare `Response` would fall back to no `Cache-Control` at all —
+    which does not mean "do not cache", it means a cache may hold it heuristically for as
+    long as it likes, and a CDN rule marking the path eligible would do exactly that.
+
+    So the disabled setting is asserted here for both halves of the document set together.
+    The prose side has always been right; the JSON side was not until the header was seeded
+    before `_static_cacheable` could decline to overwrite it.
+    """
+    import config
+
+    both = (
+        "/llms.txt",
+        "/robots.txt",
+        "/.well-known/security.txt",
+        "/openapi.json",
+        "/config",
+        "/sitemap.xml",
+        "/.well-known/agent.json",
+        "/.well-known/api-catalog",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/mcp/server-card.json",
+    )
+    with config.override(STATIC_CACHE_SECONDS=0):
+        for path in both:
+            assert client.get(path).headers["cache-control"] == "no-store", path
 
 
 def test_the_per_caller_and_liveness_surfaces_are_never_edge_cacheable(client):
@@ -1546,20 +1753,31 @@ def test_the_mcp_server_card_is_served_and_conforms_to_the_extension_schema(clie
 
     The schema is unratified and lives outside this repo, so a network fetch would make
     this suite depend on a draft moving under it. What is pinned instead is the contract as
-    of the SEP-review snapshot: `$schema`, `name`, `version` and `description` are required;
-    `name` is reverse-DNS with exactly one slash; `description` is capped at 100 characters;
-    a remote's `type` is one of two strings. Those are the ways a card is invalid rather
-    than merely unfashionable, and they are cheap to keep true.
+    of the SEP-review snapshot: `name`, `version` and `description` are required; `name` is
+    reverse-DNS with exactly one slash; `description` is capped at 100 characters; a
+    remote's `type` is one of two strings. Those are the ways a card is invalid rather than
+    merely unfashionable, and they are cheap to keep true.
+
+    `$schema` is the SEP's fourth required field and is deliberately absent, so this asserts
+    its absence rather than its value. It used to be asserted equal to
+    `.../schemas/v1/server-card.schema.json`, a URL that 404s and always has — the registry
+    serves schemas under dated paths and publishes none for the card at all. Pinning the
+    literal made this test agree with the code and both of them wrong about the world, which
+    is the failure mode a test like this is supposed to prevent. What is worth pinning is
+    the decision: no `$schema` until one resolves, and never a guessed URL.
     """
+    import manifest
+
     card = client.get("/.well-known/mcp/server-card.json")
     assert card.status_code == 200
     assert card.headers["content-type"].startswith("application/json")
     doc = card.json()
 
-    for required in ("$schema", "name", "version", "description"):
+    for required in ("name", "version", "description"):
         assert doc.get(required), required
-    assert doc["$schema"] == (
-        "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+    assert "$schema" not in doc, (
+        "no schema is published for this format; a $schema that 404s fails a strict "
+        "validator that an absent one would not"
     )
     assert re.fullmatch(r"[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+", doc["name"]), doc["name"]
     assert 3 <= len(doc["name"]) <= 200
@@ -1568,7 +1786,10 @@ def test_the_mcp_server_card_is_served_and_conforms_to_the_extension_schema(clie
     (remote,) = doc["remotes"]
     assert remote["type"] == "streamable-http"  # the enum's other member is the dead `sse`
     assert remote["url"].startswith("https://")
-    assert remote["supportedProtocolVersions"]
+    # Non-empty is not the assertion that matters — a stale list is non-empty, which is how
+    # this card advertised a two-revision-old version for all of 0.11.x. The versions are
+    # held to the wrapper's own in tests/unit/test_mcp_constant_parity.py.
+    assert remote["supportedProtocolVersions"] == list(manifest.MCP_PROTOCOL_VERSIONS)
 
 
 def test_the_server_card_reports_the_running_version_and_the_handshake_name(client):

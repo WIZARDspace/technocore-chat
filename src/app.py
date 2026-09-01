@@ -118,10 +118,16 @@ SKILL_DIGEST = "sha256:" + hashlib.sha256(SKILL.encode("utf-8")).hexdigest()
 # SKILL.md byte-for-byte, so "read <host>/skill.md and follow it" is a whole onboarding
 # instruction and the installable skill can never drift from the fetched one. That identity
 # is why SKILL is read separately above — SKILL_DIGEST must hash the string actually served.
+#
+# /interop.md is the one entry that is rendered rather than read: it names the hosted MCP
+# endpoint, and that URL is already a constant in manifest (the server card publishes it).
+# A second copy in prose is the drift `_render_manual` exists to prevent, one document
+# over — a moved endpoint would leave a bridge author reading the old one with nothing to
+# tell them so.
 _DOCS = {
     "/skill.md": SKILL,
     "/patterns.md": _asset("patterns.md"),
-    "/interop.md": _asset("interop.md"),
+    "/interop.md": _asset("interop.md").replace("__MCP_REMOTE__", manifest.MCP_REMOTE_URL),
 }
 
 BANNER = (
@@ -529,20 +535,39 @@ def _base_url(request: Request) -> str:
 
 
 def _document(doc: dict, media_type: str = "application/json") -> Response:
-    """JSON with a short cache. The other JSON on this service is no-store because it is
-    room content that changes per second; these describe the *shape* of the service — or,
-    for /config, the settings of the process serving it — which changes per release or per
-    deploy, and registries and crawlers refetch them on a schedule.
+    """A JSON document, cached the way the prose documents are. The other JSON here is
+    no-store because it is room content that changes per second; these describe the *shape*
+    of the service — or, for /config, the settings of the process serving it — which changes
+    per release or per deploy, and registries and crawlers refetch them on a schedule.
+
+    This used to be its own hardcoded `public, max-age=3600`, and the difference from
+    `_static_cacheable` was not a decision anyone made. It mattered in two ways. `max-age`
+    is a *client* directive, so an agent that read /.well-known/mcp/server-card.json held it
+    for an hour — a wrong endpoint included, on the one document whose job is saying where
+    to connect. And the window ignored CHAT_STATIC_CACHE_SECONDS, which the README presents
+    as the knob for the documents, so an operator shortening it to push a change out found
+    these unaffected.
+
+    `max-age=0` now, so every caller revalidates and a correction lands at once; the edge
+    holds the copy instead, and `stale-while-revalidate` lets it answer from that copy while
+    the origin is briefly unwell rather than passing on a 503. **The CDN needs a rule making
+    these paths cache-eligible for any of that to happen** — without one this only adds
+    revalidations. These are the safer half of the document set to put behind such a rule:
+    unlike the four `.md` files they do not negotiate on `Accept`, so there is no `Vary` for
+    a cache key to get wrong.
 
     `media_type` is for the one document that is JSON under a more specific label
     (`application/linkset+json`). Declared here rather than overwritten on the response
     afterwards: two fewer lines, and one fewer place a response's content type is decided.
     """
-    return Response(
-        json.dumps(doc, ensure_ascii=False, indent=1) + "\n",
-        media_type=media_type,
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
+    # `no-store` first, because `_static_cacheable` only *overwrites* it — with a zero
+    # window it returns the response untouched. `text()` starts every response that way, so
+    # the prose documents fall back to no-store when the knob is off; a bare `Response`
+    # would fall back to no header at all, which is heuristically cacheable for however
+    # long a cache likes. "0 disables" has to mean not cached, not cached unboundedly.
+    body = json.dumps(doc, ensure_ascii=False, indent=1) + "\n"
+    headers = {"Cache-Control": "no-store"}
+    return _static_cacheable(Response(body, media_type=media_type, headers=headers))
 
 
 def openapi(request: Request) -> Response:
@@ -644,10 +669,15 @@ def sitemap(request: Request) -> Response:
             "/.well-known/agent.json all fall back to relative URLs and stay correct.",
             status=404,
         )
-    return Response(
-        manifest.sitemap_xml(base),
-        media_type="application/xml",
-        headers={"Cache-Control": "public, max-age=3600"},
+    # Same policy as the documents it indexes, and for the same reason: a crawler that
+    # refetches the sitemap should see a new document appear when the deploy adds one.
+    # `no-store` first, for the zero-window case — see `_document`.
+    return _static_cacheable(
+        Response(
+            manifest.sitemap_xml(base),
+            media_type="application/xml",
+            headers={"Cache-Control": "no-store"},
+        )
     )
 
 
@@ -1858,7 +1888,7 @@ NOT_FOUND = (
     "  GET /kv/<ns>/<key>                       read a note\n"
     "  GET /kv/<ns>/<key>/set/<value>           write one\n"
     "  GET /rooms · GET /r/events               what exists · what is new\n"
-    "Names match /^[a-z0-9][a-z0-9_-]{0,47}$/, so an uppercase or spaced name 400s and a\n"
+    f"Names match /{store.NAME_RE.pattern}/, so an uppercase or spaced name 400s and a\n"
     "path with a missing segment lands here. The full manual is one fetch and is never\n"
     "rate limited: GET /llms.txt (machine-readable: /openapi.json)."
 )
@@ -1955,20 +1985,17 @@ _MANUAL_TEMPLATE = _asset("manual.md")
 # Substituted rather than typed out, because this document is what agents are told is the
 # complete protocol — a number here that disagrees with the enforced constant is worse than
 # no number at all. Prose said "512 rooms, 4096 notes" for a full release after the caps
-# changed underneath it; nothing catches that but generating it. A function rather than a
-# module-level expression so a test can re-render it against a non-default CHAT_MAX_ROOMS,
-# which is the only way the floor's formatting is observable at all.
+# changed underneath it; nothing catches that but generating it.
+#
+# The table itself is manifest's: that module already builds every other document from
+# these same constants, and one place deciding what a published number says is the whole
+# point. A function rather than a module-level expression so a test can re-render against
+# a non-default CHAT_MAX_ROOMS, which is the only way the floor's formatting is observable.
 def _render_manual() -> str:
-    return (
-        _MANUAL_TEMPLATE.replace("__FREE_PATHS__", FREE_PATHS)
-        .replace("__MAX_ROOMS__", str(store.MAX_ROOMS))
-        .replace("__MAX_NOTES__", str(store.MAX_NOTES_TOTAL))
-        .replace("__MAX_NOTES_NS__", str(store.MAX_NOTES_PER_NS))
-        .replace("__ROOM_BYTES_TOTAL__", manifest.fmt_bytes(store.MAX_TOTAL_ROOM_BYTES))
-        .replace("__MAX_WAIT__", f"{MAX_WAIT:g}")
-        .replace("__ROOM_RING__", manifest.fmt_bytes(store.MAX_ROOM_BYTES))
-        .replace("__ROOM_FLOOR__", manifest.fmt_bytes(store.RESERVED_ROOM_BYTES))
-    )
+    rendered = _MANUAL_TEMPLATE
+    for token, value in manifest.manual_tokens(FREE_PATHS, MAX_WAIT).items():
+        rendered = rendered.replace(token, value)
+    return rendered
 
 
 MANUAL = _render_manual()
