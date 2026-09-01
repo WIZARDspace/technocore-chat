@@ -1709,17 +1709,16 @@ def note_list(request: Request) -> Response:
     if retry:
         return limit.limited("read", RATE_READ, retry, text=text, max_wait=MAX_WAIT)
     ns = request.path_params["ns"]
-    stats = store.note_ns_stats(config.ROOT, ns)
     # ?keys=0 skips the full listing: list_notes() walks and returns every key
     # name in the namespace, which is exactly the expensive, 503-prone shape
     # #510 measured (131,072 names to answer one yes/no question). A caller who
     # only wants at_capacity/capacity_per_namespace should never pay that cost.
     # Same falsy-value set as _condition()'s if_absent parsing.
-    skip_listing = request.query_params.get("keys") in ("0", "false", "no")
-    keys = [] if skip_listing else store.list_notes(config.ROOT, ns)
+    skip = request.query_params.get("keys") in ("0", "false", "no")
+    keys = [] if skip else store.list_notes(config.ROOT, ns)
     return respond(
         request,
-        {"ns": ns, "keys": keys, **stats},
+        {"ns": ns, "keys": keys, **store.note_ns_stats(config.ROOT, ns)},
         "\n".join(f"/kv/{ns}/{k}" for k in keys),
         budget_note("read", left, RATE_READ),
     )
