@@ -136,8 +136,13 @@ async function route(request, env) {
 
     const pathname = new URL(request.url).pathname;
 
+    // GET only: the Cache API rejects a non-GET request, so a HEAD entering this lane
+    // would throw on `cache.put` and unwind to the fail-open handler, which fetches the
+    // origin a second time — two origin requests for the one path this lane exists to
+    // keep off the origin, and a swallowed exception hiding it. A HEAD falls through to
+    // the origin path below instead, which answers it in one request.
     const cacheFor = EDGE_CACHED_SECONDS[pathname];
-    if (cacheFor) return edgeCached(request, pathname, cacheFor);
+    if (cacheFor && request.method === "GET") return edgeCached(request, pathname, cacheFor);
 
     if (STATIC_FIRST.has(pathname)) {
       const copy = await stored(request, env, pathname, { fallback: false });
