@@ -2550,8 +2550,7 @@ def note_ns_stats(root: Path, ns: str) -> dict:
     the same cap) -- the difference is only that this doesn't require attempting a
     write to find out.
     """
-    ns_dir = _note_ns_dir(root, ns)
-    total, _ = _note_totals(ns_dir, _ns_totals)
+    total, _ = _note_totals(_note_ns_dir(root, ns), _ns_totals)
     return {"at_capacity": total >= MAX_NOTES_PER_NS, "capacity_per_namespace": MAX_NOTES_PER_NS}
 
 
