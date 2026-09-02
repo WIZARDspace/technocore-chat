@@ -1713,8 +1713,14 @@ def note_list(request: Request) -> Response:
     # name in the namespace, which is exactly the expensive, 503-prone shape
     # #510 measured (131,072 names to answer one yes/no question). A caller who
     # only wants at_capacity/capacity_per_namespace should never pay that cost.
-    # Same falsy-value set as _condition()'s if_absent parsing.
-    skip = request.query_params.get("keys") in ("0", "false", "no")
+    # The accepted spellings are manifest.KEYS -- the same object _condition() reads for
+    # if_absent, and the same object the parameter's published description renders from, so
+    # the set the server honours cannot drift from the set the contract advertises (#282).
+    # The `"1"` stands in for an absent parameter: it is a true spelling, so omitting `keys`
+    # keeps today's default of listing. An unrecognised spelling reads as true and pays for
+    # the listing -- advisory, because the cost of misreading one is latency, not a wrong
+    # answer; `at_capacity` is correct either way.
+    skip = not manifest.KEYS.get(request.query_params.get("keys", "1").lower(), True)
     keys = [] if skip else store.list_notes(config.ROOT, ns)
     return respond(
         request,
