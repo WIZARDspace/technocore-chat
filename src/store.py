@@ -2009,12 +2009,17 @@ def _at_capacity(cap: int, what: str, where: str) -> StoreError:
     `capacity_per_namespace`, the cap this message already carries, but no per-namespace
     count to read it against. `/kv/<ns>` lists the namespace being counted, bar its
     unlisted `p-` keys, which the cap counts and nothing enumerates (see `unlisted`).
+
+    The stillborn clause is a room rule and says so. `reap` passes `stillborn_rule=True`
+    only for `("rooms", ".jsonl")`, so a note has never gone at 24 hours however new it is,
+    and the global note refusal twelve lines below already states the 7-day rule without it.
     """
+    stillborn = " (a room still on its first message goes after 24 hours)" if what == "room" else ""
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
         f"Existing {what}s still accept writes, so reuse one you already have — "
-        f"GET {where} shows what exists. Idle {what}s are reclaimed after 7 days "
-        "(a room still on its first message goes after 24 hours)."
+        f"GET {where} shows what exists. Idle {what}s are reclaimed after 7 days"
+        f"{stillborn}."
     )
 
 

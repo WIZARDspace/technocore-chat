@@ -194,24 +194,33 @@ def test_a_capacity_refusal_carries_the_numbers_a_caller_acts_on(tmp_path, monke
 
 
 def test_a_capacity_refusal_points_at_the_surface_that_shows_the_full_cap(tmp_path, monkeypatch):
-    """Each refusal has to name a path that can actually show the count that is full.
+    """Each refusal has to name a path that can actually show the count that is full, and it
+    has to state a reclamation rule the reaper actually applies to the thing being refused.
 
     /rooms is right for a room. It is wrong for a per-namespace note cap: those note figures
     are the global aggregate and are blind to namespaces by design (note_stats), so a
     caller sent there sees plenty of headroom while the namespace it asked for is at its
     cap. /kv/<ns> is the surface that lists the namespace being counted.
+
+    The stillborn clause is the same fault one field along. `reap` passes stillborn_rule=True
+    only for ("rooms", ".jsonl"), so no note has ever been reclaimed at 24 hours, yet the
+    note refusal carried the room's 24-hour sentence. The global note refusal below it states
+    the 7-day rule alone, which is what a note actually gets.
     """
     import store
 
     monkeypatch.setattr(store, "MAX_ROOMS", 1)
     store.append(tmp_path, "only", "bot", "hi")
-    with pytest.raises(store.StoreError, match=r"GET /rooms shows what exists"):
+    with pytest.raises(store.StoreError, match=r"GET /rooms shows what exists") as room:
         store.append(tmp_path, "second", "bot", "hi")
+    assert "first message goes after 24 hours" in str(room.value)
 
     monkeypatch.setattr(store, "MAX_NOTES_PER_NS", 1)
     store.note_set(tmp_path, "did", "only", "hi")
-    with pytest.raises(store.StoreError, match=r"GET /kv/did shows what exists"):
+    with pytest.raises(store.StoreError, match=r"GET /kv/did shows what exists") as note:
         store.note_set(tmp_path, "did", "second", "hi")
+    assert str(note.value).endswith("Idle notes are reclaimed after 7 days.")
+    assert "24 hours" not in str(note.value)
 
     # A second namespace, to pin that the path is the namespace asked for rather than a
     # constant that happens to read correctly for the first one.
