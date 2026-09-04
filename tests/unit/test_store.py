@@ -211,13 +211,13 @@ def test_a_capacity_refusal_points_at_the_surface_that_shows_the_full_cap(tmp_pa
 
     monkeypatch.setattr(store, "MAX_ROOMS", 1)
     store.append(tmp_path, "only", "bot", "hi")
-    with pytest.raises(store.StoreError, match=r"GET /rooms shows what exists") as room:
+    with pytest.raises(store.StoreError, match=r"GET /rooms lists what exists") as room:
         store.append(tmp_path, "second", "bot", "hi")
     assert "first message goes after 24 hours" in str(room.value)
 
     monkeypatch.setattr(store, "MAX_NOTES_PER_NS", 1)
     store.note_set(tmp_path, "did", "only", "hi")
-    with pytest.raises(store.StoreError, match=r"GET /kv/did shows what exists") as note:
+    with pytest.raises(store.StoreError, match=r"GET /kv/did lists what exists") as note:
         store.note_set(tmp_path, "did", "second", "hi")
     assert str(note.value).endswith("Idle notes are reclaimed after 7 days.")
     assert "24 hours" not in str(note.value)
@@ -225,8 +225,61 @@ def test_a_capacity_refusal_points_at_the_surface_that_shows_the_full_cap(tmp_pa
     # A second namespace, to pin that the path is the namespace asked for rather than a
     # constant that happens to read correctly for the first one.
     store.note_set(tmp_path, "plans", "only", "hi")
-    with pytest.raises(store.StoreError, match=r"GET /kv/plans shows what exists"):
+    with pytest.raises(store.StoreError, match=r"GET /kv/plans lists what exists"):
         store.note_set(tmp_path, "plans", "second", "hi")
+
+
+def test_a_capacity_refusal_names_the_unlisted_rooms_its_listing_omits(tmp_path, monkeypatch):
+    """Both room refusals send the caller to /rooms, and /rooms cannot show everything the
+    cap counts: room_stats filters through _listable before reporting `total` and `bytes`,
+    while the count and the budget both come from _count_rooms, an unfiltered walk. An
+    unlisted room is therefore charged against a cap it never appears in, and a caller
+    reconciling a refusal against the listing reads a figure under the cap and concludes the
+    refusal was spurious -- #688, where /rooms reported 54,391 of 81,920 while every create
+    was refused. The message has to say so itself; a second fetch cannot be trusted to
+    agree, because MAX_ROOMS here is an import-time snapshot and /config reads the live one.
+
+    The per-namespace note refusal has the same shape one surface over: list_notes filters
+    the same way while the cap counts every .txt, so the sentence is not room-specific.
+    """
+    import store
+
+    monkeypatch.setattr(store, "MAX_ROOMS", 1)
+    store.append(tmp_path, "p-secret", "bot", "hi")
+    with pytest.raises(store.StoreError) as room:
+        store.append(tmp_path, "second", "bot", "hi")
+    assert "unlisted rooms count against this cap and are not listed" in str(room.value)
+    # The room that filled the cap is the one the listing will not name, which is the case
+    # the sentence exists for rather than a hypothetical.
+    assert store.unlisted("p-secret") and not store._listable("p-secret")
+    assert store.room_stats(tmp_path)["total"] == 0
+
+    monkeypatch.setattr(store, "MAX_NOTES_PER_NS", 1)
+    store.note_set(tmp_path, "did", "only", "hi")
+    with pytest.raises(store.StoreError) as note:
+        store.note_set(tmp_path, "did", "second", "hi")
+    assert "unlisted notes count against this cap and are not listed" in str(note.value)
+
+
+def test_the_byte_budget_refusal_names_them_too(tmp_path, monkeypatch):
+    """The budget is the second room cap and carries its own literal rather than going
+    through _at_capacity, so it can drift from the count refusal. It reports `bytes` from
+    the same _listable-filtered walk, so it under-reports for the same reason and says so
+    in the same terms -- budget rather than cap, because that is what is full."""
+    import store
+
+    monkeypatch.setattr(store, "MAX_ROOMS", 10_000)  # far from binding: bytes must do it
+    monkeypatch.setattr(store, "MAX_TOTAL_ROOM_BYTES", 300)
+    store.append(tmp_path, "p-secret", "bot", "x" * 300)  # 368B, and no events room: a p-
+    # room is not announced, so every byte charged here belongs to a room /rooms omits.
+    # The reaper establishes the byte figure the budget reads (#578), same as the test above.
+    (tmp_path / ".reaped").unlink()
+    store._reap(tmp_path)
+    assert store.room_stats(tmp_path)["bytes"] == 0  # the listing sees none of it
+    with pytest.raises(store.StoreError) as full:
+        store.append(tmp_path, "overflow", "bot", "hi")
+    assert "room storage is full" in str(full.value)
+    assert "unlisted rooms count against this budget and are not listed" in str(full.value)
 
 
 def test_an_empty_usage_file_reads_as_no_pressure(tmp_path):

@@ -2010,6 +2010,18 @@ def _at_capacity(cap: int, what: str, where: str) -> StoreError:
     count to read it against. `/kv/<ns>` lists the namespace being counted, bar its
     unlisted `p-` keys, which the cap counts and nothing enumerates (see `unlisted`).
 
+    That exclusion is why the message says *lists* rather than *shows*, and names it. Both
+    surfaces enumerate a strict subset of what their cap counts, and in the same direction:
+    `room_stats` filters every entry through `_listable` before reporting `total` and
+    `bytes`, while the count and budget enforced here come from `_count_rooms`, an
+    unfiltered walk of every `.jsonl`. So a caller sent to `/rooms` to reconcile a refusal
+    can read a figure well under the cap and conclude the refusal was spurious -- the gap
+    being exactly the `p-` and `mb-p-` rooms the listing may not name. #688 is that
+    happening in production: `/rooms` reported 54,391 of 81,920 while every create was
+    refused. Naming the exclusion inline is the whole fix; pointing the caller at a second
+    endpoint is not, because no endpoint is guaranteed to agree with the worker that
+    refused (`MAX_ROOMS` is an import-time snapshot, `/config` reads the live value).
+
     The stillborn clause is a room rule and says so. `reap` passes `stillborn_rule=True`
     only for `("rooms", ".jsonl")`, so a note has never gone at 24 hours however new it is,
     and the global note refusal twelve lines below already states the 7-day rule without it.
@@ -2018,7 +2030,8 @@ def _at_capacity(cap: int, what: str, where: str) -> StoreError:
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
         f"Existing {what}s still accept writes, so reuse one you already have — "
-        f"GET {where} shows what exists. Idle {what}s are reclaimed after 7 days"
+        f"GET {where} lists what exists, though unlisted {what}s count against this cap "
+        f"and are not listed. Idle {what}s are reclaimed after 7 days"
         f"{stillborn}."
     )
 
@@ -2093,9 +2106,9 @@ def _check_room_capacity(root: Path, path: Path) -> None:
             f"room storage is full ({used >> 20} MiB of a {MAX_TOTAL_ROOM_BYTES >> 20} MiB "
             "budget, and this would be a new room). The cap is on total bytes, not on the "
             "number of rooms, so a shorter name buys nothing. Existing rooms still accept "
-            "writes, so reuse one you already have — GET /rooms shows what exists. Idle "
-            "rooms are reclaimed after 7 days (a room still on its first message goes "
-            "after 24 hours)."
+            "writes, so reuse one you already have — GET /rooms lists what exists, though "
+            "unlisted rooms count against this budget and are not listed. Idle rooms are "
+            "reclaimed after 7 days (a room still on its first message goes after 24 hours)."
         )
 
 
