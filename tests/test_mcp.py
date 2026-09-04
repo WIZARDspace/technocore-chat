@@ -257,7 +257,7 @@ ADVERTISED = {
         },
         ["namespace", "key", "value"],
     ),
-    "list_notes": ({"namespace": "string"}, ["namespace"]),
+    "list_notes": ({"namespace": "string", "limit": "integer?"}, ["namespace"]),
     "read_docs": ({"page": "string"}, []),
     "say_signed": (
         {
@@ -432,6 +432,56 @@ def test_say_without_a_nick_falls_back_to_the_session_anon_name(mcp):
     # …and both overrides still win over the fallback: the env default, then the argument.
     mcp.call("say", {"room": "lobby", "text": "named", "nick": "alice"})
     assert "<~alice> named" in text_of(mcp.call("read_room", {"room": "lobby"}))
+
+
+def test_list_notes_bounds_a_large_namespace_and_says_what_it_dropped(mcp, tmp_path):
+    """#698: /kv/<ns> has no limit of its own, so an unbounded listing put the whole
+    namespace in one tool result — 3.2 MB for `did` at its cap. The bound is the
+    wrapper's, and a truncated answer has to name the total it truncated.
+
+    Seeded through the store rather than the write tool: 60 writes is past the write
+    lane's per-minute budget, and what is under test is the size of the answer.
+    """
+    import store
+
+    for i in range(60):
+        store.note_set(tmp_path, "many", f"k{i:03d}", "v")
+
+    default = text_of(mcp.call("list_notes", {"namespace": "many"}))
+    assert default.count("/kv/many/") == mcp.module.NOTES_LIMIT_DEFAULT
+    assert "50 of 60 keys shown" in default
+
+    asked = text_of(mcp.call("list_notes", {"namespace": "many", "limit": 10}))
+    assert asked.count("/kv/many/") == 10 and "10 of 60 keys shown" in asked
+
+    # Advisory, so out of range is clamped rather than refused — the doctrine the other
+    # listing tools follow, and the reason `limit` carries no JSON-Schema bound. The
+    # clamp is the service's own (`app._rooms`): negative is the default, 0 is 1.
+    def keys_for(limit):
+        return text_of(mcp.call("list_notes", {"namespace": "many", "limit": limit})).count(
+            "/kv/many/"
+        )
+
+    assert keys_for(9999) == min(mcp.module.NOTES_LIMIT_MAX, 60)
+    assert keys_for(0) == 1
+    assert keys_for(-5) == mcp.module.NOTES_LIMIT_DEFAULT
+
+
+def test_clamp_notes_keeps_the_budget_line_a_truncation_is_not_part_of(mcp):
+    """`budget_note` appends a `#` line once the read budget is nearly spent (limit.py:396).
+    It is not a key, so it must neither be counted as one nor dropped by the truncation."""
+    budget = "# budget: 4 of 60 reads left this minute"
+    body = "\n".join(f"/kv/many/k{i:03d}" for i in range(60)) + "\n" + budget
+    out = mcp.module._clamp_notes(body, 10)
+    assert out.count("/kv/many/") == 10
+    assert "10 of 60 keys shown" in out and budget in out
+
+
+def test_list_notes_leaves_a_listing_under_the_bound_untouched(mcp):
+    """The count line is what a truncation costs, so a listing that fits does not pay it."""
+    mcp.call("write_note", {"namespace": "few", "key": "only", "value": "v"})
+    body = text_of(mcp.call("list_notes", {"namespace": "few"}))
+    assert "/kv/few/only" in body and "keys shown" not in body
 
 
 def test_notes_round_trip_and_a_failed_condition_returns_the_current_value(mcp):
