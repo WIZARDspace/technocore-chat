@@ -7,11 +7,18 @@ three can carry unchanged.
 """
 
 import _client
+import pytest
 from _client import _claim, _keypair, _race_before_lock
 
 client = _client.client  # the shared TestClient fixture
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#628 is open: the owner note is written with no compare-and-set. strict, so "
+    "this fails the build the moment it starts passing -- whoever closes #628 deletes "
+    "this marker in the same change, and the suite refuses to let it be forgotten.",
+)
 def test_two_first_claims_with_distinct_nonces_cannot_both_own_a_room(
     client, tmp_path, monkeypatch
 ):
@@ -28,6 +35,12 @@ def test_two_first_claims_with_distinct_nonces_cannot_both_own_a_room(
     The interleaving is forced at the owner note's own lock rather than left to timing: the
     losing claimer is between the gate read that saw "unowned" and the lock it is about to
     take, which is exactly where a server-side compare-and-set has to live to help.
+
+    Marked strict-xfail rather than left red. A red test cannot merge, so it would sit in a
+    branch and gate nothing; strict-xfail lands the bar on main today, keeps CI honest while
+    #628 is open, and turns the fix into a build failure until the marker goes. Measured on
+    merge with main at 82d9429: this xpasses on #629 (so #629 closes #628), still xfails on
+    #501, and #179 cannot be measured -- it conflicts with main in four files.
     """
     import store
 
