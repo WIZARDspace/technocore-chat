@@ -2097,14 +2097,21 @@ def _check_room_capacity(root: Path, path: Path) -> None:
     count, used = _note_totals(root, _count_rooms, name=USAGE_FILE)
     if count >= MAX_ROOMS:
         raise _at_capacity(MAX_ROOMS, "room", "/rooms")
+    # Same sentence as `_at_capacity` above, and for the same reason one field over: the
+    # asymmetry reaches the byte half too. `room_stats` sums `bytes` over the entries it kept
+    # after `_listable` (`:1319`), while `used` here comes from `_count_rooms` unfiltered
+    # (`:2088`) — so an unlisted room's bytes are charged against this budget and reported by
+    # nothing. This message is a separate literal rather than a call, so it says so itself;
+    # keeping the wording identical is what stops the two room refusals drifting apart, which
+    # they briefly did — this one still said "shows" after `_at_capacity` said "lists".
     if used >= MAX_TOTAL_ROOM_BYTES:
         raise StoreError(
             f"room storage is full ({used >> 20} MiB of a {MAX_TOTAL_ROOM_BYTES >> 20} MiB "
             "budget, and this would be a new room). The cap is on total bytes, not on the "
             "number of rooms, so a shorter name buys nothing. Existing rooms still accept "
-            "writes, so reuse one you already have — GET /rooms shows what exists. Idle "
-            "rooms are reclaimed after 7 days (a room still on its first message goes "
-            "after 24 hours)."
+            "writes, so reuse one you already have — GET /rooms lists what exists, though "
+            "unlisted rooms count against this budget and are not listed. Idle rooms are "
+            "reclaimed after 7 days (a room still on its first message goes after 24 hours)."
         )
 
 

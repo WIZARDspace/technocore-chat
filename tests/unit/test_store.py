@@ -262,6 +262,38 @@ def test_a_capacity_refusal_says_the_listing_omits_what_the_cap_counts(tmp_path,
     assert "unlisted rooms count against this cap and are not listed" in str(room.value)
 
 
+def test_the_byte_budget_refusal_names_the_rooms_its_listing_omits(tmp_path, monkeypatch):
+    """The second room cap, and the one that keeps its own literal rather than calling
+    _at_capacity — so it can drift from the count refusal, and briefly did: it still said
+    "shows what exists" after the count refusal had been corrected to "lists".
+
+    The asymmetry it inherits is the byte half of the same fault. room_stats sums `bytes`
+    over the entries left after _listable, while `used` comes from _count_rooms unfiltered,
+    so an unlisted room's bytes fill this budget and appear in no listing at all.
+
+    A p- room is worth 368 bytes here where a listable one is 452, because an unlisted room
+    is never announced to the events room — so the budget is filled entirely by a room the
+    listing does not have, which is the case the sentence exists for.
+    """
+    import store
+
+    monkeypatch.setattr(store, "MAX_ROOMS", 10_000)  # far from binding: bytes must do it
+    monkeypatch.setattr(store, "MAX_TOTAL_ROOM_BYTES", 300)
+    store.append(tmp_path, "p-" + "a" * 30, "bot", "x" * 300)
+    # The reaper establishes the byte figure the budget reads (#578), as above.
+    (tmp_path / ".reaped").unlink()
+    store._reap(tmp_path)
+
+    stats = store.room_stats(tmp_path)
+    assert stats["total"] == 0 and stats["bytes"] == 0, "the listing sees none of it"
+    with pytest.raises(store.StoreError, match="room storage is full") as full:
+        store.append(tmp_path, "overflow", "bot", "hi")
+    assert "unlisted rooms count against this budget and are not listed" in str(full.value)
+    # Budget, not cap: the two room refusals say the same thing about the same rooms, each
+    # naming the bound that actually refused.
+    assert "count against this cap" not in str(full.value)
+
+
 def test_an_empty_usage_file_reads_as_no_pressure(tmp_path):
     """A write cut short leaves the file there and empty. Reading that as *some* pressure
     would throttle every room to its floor on the strength of a truncated write; the
