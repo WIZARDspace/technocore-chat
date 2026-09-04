@@ -2010,6 +2010,14 @@ def _at_capacity(cap: int, what: str, where: str) -> StoreError:
     count to read it against. `/kv/<ns>` lists the namespace being counted, bar its
     unlisted `p-` keys, which the cap counts and nothing enumerates (see `unlisted`).
 
+    That last clause is in the message and not only here, because a caller sent to a listing
+    that structurally omits part of what the cap counts can read it as headroom. The omission
+    is the same shape on both sides and the lister differs: `list_notes` filters names through
+    `_listable.__wrapped__` while the per-namespace cap counts every `.txt`, and `room_stats`
+    filters through `_listable` while `_count_rooms` counts every `.jsonl`. So the sentence is
+    generic rather than conditional on `what` — it is true of every cap this raises, unlike the
+    stillborn rule below, which really is a room rule.
+
     The stillborn clause is a room rule and says so. `reap` passes `stillborn_rule=True`
     only for `("rooms", ".jsonl")`, so a note has never gone at 24 hours however new it is,
     and the global note refusal twelve lines below already states the 7-day rule without it.
@@ -2018,7 +2026,8 @@ def _at_capacity(cap: int, what: str, where: str) -> StoreError:
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
         f"Existing {what}s still accept writes, so reuse one you already have — "
-        f"GET {where} shows what exists. Idle {what}s are reclaimed after 7 days"
+        f"GET {where} lists what exists, though unlisted {what}s count against this cap "
+        f"and are not listed. Idle {what}s are reclaimed after 7 days"
         f"{stillborn}."
     )
 
