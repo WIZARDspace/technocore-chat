@@ -294,15 +294,17 @@ def _clamp_notes(body: str, limit: int | None) -> str:
     Clamped the way the service clamps its own listing (`app._rooms`, via `_cursor`):
     absent or negative is the default, 0 is 1, anything above the ceiling is the ceiling.
     Only `/kv/`-prefixed lines are keys — a nearly-spent read budget adds a `#` line that
-    is not one, and must survive the truncation it is not part of.
+    is not one, and must survive the truncation it is not part of *in place*: the keys are
+    dropped where they sit rather than re-joined after the rest, so any framing the service
+    puts around a listing keeps its position relative to the keys it frames.
     """
     lines = body.splitlines()
-    keys = [line for line in lines if line.startswith("/kv/")]
+    keys = [i for i, line in enumerate(lines) if line.startswith("/kv/")]
     n = NOTES_LIMIT_DEFAULT if limit is None or limit < 0 else limit
     n = min(n or 1, NOTES_LIMIT_MAX)
     if len(keys) <= n:
         return body
-    kept = keys[:n] + [line for line in lines if not line.startswith("/kv/")]
+    kept = [ln for i, ln in enumerate(lines) if i < keys[n] or not ln.startswith("/kv/")]
     return "\n".join(kept) + (
         f"\n\n{n} of {len(keys)} keys shown (limit {n}, max {NOTES_LIMIT_MAX}). "
         "Read /kv/<namespace> directly for the whole listing."

@@ -467,14 +467,28 @@ def test_list_notes_bounds_a_large_namespace_and_says_what_it_dropped(mcp, tmp_p
     assert keys_for(-5) == mcp.module.NOTES_LIMIT_DEFAULT
 
 
-def test_clamp_notes_keeps_the_budget_line_a_truncation_is_not_part_of(mcp):
+def test_clamp_notes_keeps_a_non_key_line_where_the_service_put_it(mcp):
     """`budget_note` appends a `#` line once the read budget is nearly spent (limit.py:396).
-    It is not a key, so it must neither be counted as one nor dropped by the truncation."""
+    It is not a key, so it must neither be counted as one nor dropped by the truncation —
+    and it must keep its *position*, not merely survive.
+
+    Position rather than presence, because the two come apart: a clamp built as
+    `keys[:n] + [non-keys]` passes a presence check while moving every non-key line to the
+    end. `/kv/<ns>` carries no prefix today — `note_list` (app.py:1746) hands `respond` a
+    body of keys and a trailing note, and BANNER is prepended only by `note_read`
+    (app.py:1503) and `render` (app.py:436) — so the leading case below is a guard on a
+    listing that does not have one yet, not a description of one that does.
+    """
     budget = "# budget: 4 of 60 reads left this minute"
-    body = "\n".join(f"/kv/many/k{i:03d}" for i in range(60)) + "\n" + budget
-    out = mcp.module._clamp_notes(body, 10)
-    assert out.count("/kv/many/") == 10
-    assert "10 of 60 keys shown" in out and budget in out
+    keys = [f"/kv/many/k{i:03d}" for i in range(60)]
+
+    out = mcp.module._clamp_notes("\n".join(keys) + "\n" + budget, 10).splitlines()
+    assert out.count("/kv/many/k000") == 1 and len([x for x in out if x.startswith("/kv/")]) == 10
+    assert "10 of 60 keys shown" in "\n".join(out)
+    assert out.index(budget) > max(i for i, x in enumerate(out) if x.startswith("/kv/"))
+
+    framed = mcp.module._clamp_notes("\n".join(["!! FRAMING", ""] + keys), 10).splitlines()
+    assert framed.index("!! FRAMING") < min(i for i, x in enumerate(framed) if x.startswith("/kv/"))
 
 
 def test_list_notes_leaves_a_listing_under_the_bound_untouched(mcp):
