@@ -89,3 +89,75 @@ jobs:
               { ...context.repo, comment_id: mine.id, body });
             else await github.rest.issues.createComment(
               { ...context.repo, issue_number: pr.number, body });
+
+  ci-not-run:
+    # #693: a fork PR from an author with no merged PR here has its CI run created as
+    # `action_required` and never executed. Nothing on the PR says so — `protected-files`
+    # reports success and `overlap` reports skipped, so the checks list looks populated,
+    # and the only hint is `mergeable_state: blocked`, which does not say why. This says
+    # why, once, in the thread where people are already looking.
+    #
+    # It does not change the gate. Approving the run stays a maintainer action; this only
+    # makes the wait legible so an approval is not read as "the repo's gate passed".
+    if: >-
+      github.event.action == 'opened' || github.event.action == 'reopened'
+      || github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    permissions:
+      # Narrower than the workflow default: this job reads run state and writes one
+      # comment, so it needs `actions: read` on top of the comment scope, and nothing else.
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            // Same fork test as protected-files: a head branch in this repository cannot
+            // be a fork, and only forks are gated. author_association is not consulted --
+            // it reports MEMBER for authors who still need approval (see #567).
+            const pr = context.payload.pull_request;
+            if (pr.head.repo && pr.head.repo.full_name === pr.base.repo.full_name) return;
+            const marker = '<!-- queue-guard-ci-not-run -->';
+            // `pull_request` and `pull_request_target` dispatch from the same push, so the
+            // CI run may not be listed yet when this job reaches the API. Poll briefly
+            // rather than reporting "never ran" against a run that is seconds from
+            // existing -- a false positive here is worse than a late comment, because it
+            // says the opposite of the truth on a PR that is fine.
+            const CI = '.github/workflows/ci.yml';
+            let run = null;
+            for (let i = 0; i < 6 && !run; i++) {
+              if (i) await new Promise(r => setTimeout(r, 10000));
+              const res = await github.rest.actions.listWorkflowRunsForRepo({
+                ...context.repo, head_sha: pr.head.sha, per_page: 100,
+              });
+              // Matched on path, not display name: the name is prose and can be edited
+              // without anyone thinking of this file.
+              run = res.data.workflow_runs.find(r => r.path === CI) || null;
+            }
+            // Only `action_required` is reported. A queued or running CI is not a problem,
+            // and no run at all after the poll is ambiguous -- it can mean the event was
+            // filtered -- so it stays silent rather than guessing.
+            const blocked = run !== null && run.conclusion === 'action_required';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (!blocked) {
+              // Upserted and removed by marker, like the overlap comment: once the run is
+              // approved the notice is wrong, and a stale warning is its own bug.
+              if (mine) await github.rest.issues.deleteComment(
+                { ...context.repo, comment_id: mine.id });
+              return;
+            }
+            const body = marker + '\nCI has not run on this head: the workflow run was ' +
+              'created as `action_required` and is waiting for a maintainer to approve ' +
+              'it. Until then the checks above do not mean the repo\'s gate passed — ' +
+              '`lint + tests + image` has not executed at all.\n\nThis is the default ' +
+              '"require approval for first-time contributors" setting, not anything ' +
+              'wrong with this pull request, and it clears once a maintainer releases ' +
+              'the run (#693).';
+            if (mine && mine.body === body) return;
+            if (mine) await github.rest.issues.updateComment(
+              { ...context.repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment(
+              { ...context.repo, issue_number: pr.number, body });
