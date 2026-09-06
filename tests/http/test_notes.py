@@ -514,3 +514,75 @@ def test_note_list_at_capacity_counts_a_hidden_p_key(client):
         body = client.get("/kv/hidden?format=json").json()
         assert body["keys"] == [], "a p- key must never appear in the listing"
         assert body["at_capacity"] is True, "but it must still count toward the cap"
+
+
+def test_note_reads_are_edge_cacheable_like_room_reads(client):
+    """The CDN's cache rule has always covered /kv/, but the handlers never marked a note
+    read shareable, so every one went to the origin — the rule matched a reply that never
+    said it could be held. A note's bytes are the same for every caller that can name it.
+
+    An unlisted `p-` key is a capability URL, so a copy keyed on that URL reaches exactly
+    the callers who could already read it, which is why it is cacheable on the same terms
+    rather than excluded.
+    """
+    client.get("/kv/e-tc-cache/k/set/value")
+    for path in ("/kv/e-tc-cache/k", "/kv/e-tc-cache"):
+        cc = client.get(path).headers["cache-control"]
+        assert "s-maxage=" in cc and "max-age=0" in cc, f"{path} is not shareable: {cc}"
+
+    # A p- key is unlisted, not unshareable: same header, and the URL is the credential.
+    client.get("/kv/p-tc-cache/k/set/secret")
+    assert "s-maxage=" in client.get("/kv/p-tc-cache/k").headers["cache-control"]
+
+
+def test_a_note_read_carrying_a_budget_footer_is_not_shared(client):
+    """The footer is one caller's pacing, so the reply stops being the CDN's to hand out.
+    This is the half that keeps the line above from leaking one caller's numbers to another.
+    """
+    import config
+
+    client.get("/kv/e-tc-cache/k/set/value")
+    with config.override(RATE_READ=8):
+        for _ in range(7):
+            client.get("/kv/e-tc-cache/k")
+        warned = client.get("/kv/e-tc-cache/k")
+        assert "# budget:" in warned.text
+        assert warned.headers["cache-control"] == "no-store"
+
+
+def test_note_list_text_lane_answers_at_capacity_too(client):
+    """The default lane must answer #510's question, not only `?format=json`.
+
+    Saku0509 asked for this footer on 2026-08-31, naming its shape (`# budget:`'s) and its
+    spelling. It was dropped, on the record and for a real reason: it was the whole of an
+    additional `core/app.py` size overage when that file had no headroom. #730 took the
+    six-line return here down to one, and the rendering sits in store beside the fact, so
+    the overage that killed it is gone rather than merely tolerated.
+
+    Without the footer `?keys=0` renders an empty body here, so the parameter added to make
+    occupancy cheap to ask for answered nothing on the lane most callers use. The footer is
+    not a disambiguator — a skipped listing and an empty namespace still render identically,
+    and they should, since the caller sent `keys` and knows which it asked for.
+    """
+    client.get("/kv/plans/next/set/ship%20the%20thing")
+
+    listed = client.get("/kv/plans").text
+    assert "/kv/plans/next" in listed
+    assert listed.rstrip().endswith("# at_capacity: no")
+
+    # keys=0 leaves the footer as the whole body — the point of the parameter.
+    skipped = client.get("/kv/plans?keys=0").text
+    assert "/kv/plans/next" not in skipped
+    assert skipped.strip() == "# at_capacity: no"
+
+    # An empty namespace renders identically, and that is the intended shape: both are
+    # honestly reporting the same fact, which is the one the caller asked for.
+    assert client.get("/kv/never-written").text.strip() == "# at_capacity: no"
+
+
+def test_note_list_text_lane_at_capacity_flips_true(client):
+    import config
+
+    with config.override(MAX_NOTES_PER_NS=1):
+        client.get("/kv/small/a/set/1")
+        assert client.get("/kv/small?keys=0").text.strip() == "# at_capacity: yes"
