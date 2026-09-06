@@ -1,17 +1,27 @@
 # The automated half of CONTRIBUTING.md "Overlapping work": one comment naming open PRs
 # that cite the same issues, and a failure on PRs editing maintainer-regenerated files.
-# Runs on pull_request_target and never checks out PR code — both jobs read only the API,
-# so an untrusted branch gets no execution here.
+# Never checks out PR code — every job reads only the API, so an untrusted branch gets no
+# execution here. That is what makes the workflow_run trigger below safe as well: it runs in
+# base-repo context, which is only dangerous to a workflow that runs the code it was told
+# about, and none of these do.
 name: queue-guard
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize]
+  # ci-not-run-clear only. Matched by workflow *name* because that is the only thing this
+  # filter accepts — the job body still matches on path, which is the stable identifier.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   pull-requests: write
 
 jobs:
   protected-files:
+    # Every job here is pull_request_target's except ci-not-run-clear, and this one reads
+    # context.payload.pull_request, which a workflow_run event does not carry.
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v9
@@ -161,3 +171,49 @@ jobs:
               { ...context.repo, comment_id: mine.id, body });
             else await github.rest.issues.createComment(
               { ...context.repo, issue_number: pr.number, body });
+
+  ci-not-run-clear:
+    # The other half of ci-not-run, and the reason it needs one: approving a gated run emits
+    # no pull_request_target event at all, so the notice cannot clear itself from that
+    # trigger. It would sit there saying CI has not run, immediately after CI ran, which is
+    # the moment the message is most wrong. Raised by @yukkie3276 on #735.
+    #
+    # Checked rather than assumed, because the obvious counter-example is not one: #156's
+    # queue-guard run at 2026-09-06T05:31:32Z looks like an approval firing the trigger, but
+    # its head `b83fc306` is a merge commit authored four seconds earlier — that was Update
+    # branch, i.e. a synchronize, not the approval.
+    #
+    # A CI run reaching `completed` is the transition pull_request_target cannot see: it is
+    # what a released run does, and what an already-running one does anyway.
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    permissions:
+      # No `actions: read` here: the run that fired this is in the event payload, and
+      # nothing else about it is read.
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            // `workflow_run.pull_requests` is empty for a fork PR — the same reason #693
+            // had to resolve heads by hand — so the head SHA is matched against open PRs.
+            // No match is the normal case for a push to main, and does nothing.
+            // A CI run on a push to main has no PR to clear, and matching it would cost a
+            // walk of every open pull request (212 of them today) on every merge.
+            const run = context.payload.workflow_run;
+            if (run.event !== 'pull_request') return;
+            const sha = run.head_sha;
+            const marker = '<!-- queue-guard-ci-not-run -->';
+            const prs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'open', per_page: 100,
+            });
+            const pr = prs.find(p => p.head.sha === sha);
+            if (!pr) return;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            // Deleted whatever the run concluded. A failed run is still a run: the notice
+            // says CI has not executed, and once it has, that is false regardless of result.
+            if (mine) await github.rest.issues.deleteComment(
+              { ...context.repo, comment_id: mine.id });
