@@ -151,7 +151,9 @@ jobs:
             const comments = await github.paginate(github.rest.issues.listComments, {
               ...context.repo, issue_number: pr.number, per_page: 100,
             });
-            const mine = comments.find(c => c.body && c.body.includes(marker));
+            const mine = comments.find(
+              c => c.user && c.user.type === 'Bot'
+                && c.body && c.body.startsWith(marker));
             if (!blocked) {
               // Upserted and removed by marker, like the overlap comment: once the run is
               // approved the notice is wrong, and a stale warning is its own bug.
@@ -202,6 +204,11 @@ jobs:
             // walk of every open pull request (212 of them today) on every merge.
             const run = context.payload.workflow_run;
             if (run.event !== 'pull_request') return;
+            // A gated run is `status: completed, conclusion: action_required`, so it
+            // reaches this trigger without having executed a single job. Clearing on
+            // it would delete the notice ci-not-run is posting for that same head, on
+            // the one transition the notice is about. It has not run; the notice stays.
+            if (run.conclusion === 'action_required') return;
             const sha = run.head_sha;
             const marker = '<!-- queue-guard-ci-not-run -->';
             const prs = await github.paginate(github.rest.pulls.list, {
@@ -212,8 +219,11 @@ jobs:
             const comments = await github.paginate(github.rest.issues.listComments, {
               ...context.repo, issue_number: pr.number, per_page: 100,
             });
-            const mine = comments.find(c => c.body && c.body.includes(marker));
-            // Deleted whatever the run concluded. A failed run is still a run: the notice
-            // says CI has not executed, and once it has, that is false regardless of result.
+            const mine = comments.find(
+              c => c.user && c.user.type === 'Bot'
+                && c.body && c.body.startsWith(marker));
+            // Deleted whatever the run concluded, the gated case above excepted. A failed
+            // run is still a run: the notice says CI has not executed, and once it has,
+            // that is false regardless of result.
             if (mine) await github.rest.issues.deleteComment(
               { ...context.repo, comment_id: mine.id });
