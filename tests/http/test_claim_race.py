@@ -1,9 +1,11 @@
 """Run: uv run --group dev python -m pytest tests
 
-The #628 regression, kept in its own file deliberately: it is the acceptance test for a
+The #173 regression, kept in its own file deliberately: it is the acceptance test for a
 race, not for an implementation. #179, #501 and #629 each propose a different mechanism
 for closing it, so the test that decides whether any of them did belongs somewhere all
 three can carry unchanged.
+
+Filed originally against #628, marked a duplicate of #173 in triage on 2026-09-06.
 """
 
 import _client
@@ -15,8 +17,8 @@ client = _client.client  # the shared TestClient fixture
 
 @pytest.mark.xfail(
     strict=True,
-    reason="#628 is open: the owner note is written with no compare-and-set. strict, so "
-    "this fails the build the moment it starts passing -- whoever closes #628 deletes "
+    reason="#173 is open: the owner note is written with no compare-and-set. strict, so "
+    "this fails the build the moment it starts passing -- whoever lands the fix deletes "
     "this marker in the same change, and the suite refuses to let it be forgotten.",
 )
 def test_two_first_claims_with_distinct_nonces_cannot_both_own_a_room(
@@ -38,8 +40,8 @@ def test_two_first_claims_with_distinct_nonces_cannot_both_own_a_room(
 
     Marked strict-xfail rather than left red. A red test cannot merge, so it would sit in a
     branch and gate nothing; strict-xfail lands the bar on main today, keeps CI honest while
-    #628 is open, and turns the fix into a build failure until the marker goes. Measured on
-    merge with main at 82d9429: this xpasses on #629 (so #629 closes #628), still xfails on
+    #173 is open, and turns the fix into a build failure until the marker goes. Measured on
+    merge with main at 82d9429: this xpasses on #629 (so #629 settles the race), still xfails on
     #501, and #179 cannot be measured -- it conflicts with main in four files.
     """
     import store
