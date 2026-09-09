@@ -147,14 +147,25 @@ jobs:
             // Only `action_required` is reported. A queued or running CI is not a problem,
             // and no run at all after the poll is ambiguous -- it can mean the event was
             // filtered -- so it stays silent rather than guessing.
-            const blocked = run !== null && run.conclusion === 'action_required';
+            // Three states, not two. `blocked === false` meant both "a run was observed
+            // and it is not gated" and "no run was observed at all", and both deleted. On a
+            // synchronize whose new run has not surfaced within the poll above, that deleted
+            // the previous head's notice and nothing re-posted it: this job fires only on
+            // opened/reopened/synchronize, and ci-not-run-clear ignores `action_required` by
+            // design. The comment above already calls the no-run case ambiguous; deleting on
+            // it was the code disagreeing with that. Raised by @yukkie3276.
+            const state = run === null ? 'unknown'
+              : run.conclusion === 'action_required' ? 'gated' : 'ran';
+            // An unobserved run is not evidence that CI executed, so nothing is written and
+            // nothing is removed. Whatever is on the thread outlives this event.
+            if (state === 'unknown') return;
             const comments = await github.paginate(github.rest.issues.listComments, {
               ...context.repo, issue_number: pr.number, per_page: 100,
             });
             const mine = comments.find(
               c => c.user && c.user.type === 'Bot'
                 && c.body && c.body.startsWith(marker));
-            if (!blocked) {
+            if (state === 'ran') {
               // Upserted and removed by marker, like the overlap comment: once the run is
               // approved the notice is wrong, and a stale warning is its own bug.
               if (mine) await github.rest.issues.deleteComment(
@@ -168,11 +179,28 @@ jobs:
               '"require approval for first-time contributors" setting, not anything ' +
               'wrong with this pull request, and it clears once a maintainer releases ' +
               'the run (#693).';
-            if (mine && mine.body === body) return;
-            if (mine) await github.rest.issues.updateComment(
-              { ...context.repo, comment_id: mine.id, body });
-            else await github.rest.issues.createComment(
+            if (!mine) await github.rest.issues.createComment(
               { ...context.repo, issue_number: pr.number, body });
+            else if (mine.body !== body) await github.rest.issues.updateComment(
+              { ...context.repo, comment_id: mine.id, body });
+            // Compare-after-write. Every read above is a snapshot, and approving a gated run
+            // emits no event this job can see, so the state can move between the read and the
+            // write -- and the write is the thing that makes a stale notice observable, so
+            // the reconcile belongs after it rather than in front of it. Re-checking before
+            // the write would only narrow the window. Raised by @Minh3132.
+            const after = await github.rest.actions.listWorkflowRunsForRepo({
+              ...context.repo, head_sha: pr.head.sha, per_page: 100,
+            });
+            const now = after.data.workflow_runs.find(r => r.path === CI) || null;
+            if (now === null || now.conclusion === 'action_required') return;
+            const fresh = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const stale = fresh.find(
+              c => c.user && c.user.type === 'Bot'
+                && c.body && c.body.startsWith(marker));
+            if (stale) await github.rest.issues.deleteComment(
+              { ...context.repo, comment_id: stale.id });
 
   ci-not-run-clear:
     # The other half of ci-not-run, and the reason it needs one: approving a gated run emits
