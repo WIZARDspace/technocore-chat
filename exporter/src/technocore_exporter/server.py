@@ -1,0 +1,163 @@
+"""Serve /metrics.
+
+`start_http_server` from the client library rather than a hand-rolled handler: it already
+answers with the right Content-Type, handles the OpenMetrics negotiation Prometheus does,
+and is the surface the library's own tests cover.
+
+Split into `settings()` / `build()` / `main()` so the configuration rules — which are where
+the security properties live — are testable without binding a socket or entering the
+serve loop.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import time
+import urllib.parse
+from typing import NamedTuple
+
+from prometheus_client import REGISTRY, start_http_server
+
+from .collector import TechnocoreCollector
+from .fetch import DEFAULT_TIMEOUT
+
+log = logging.getLogger("technocore_exporter")
+
+DEFAULT_URL = "http://127.0.0.1:8080/stats"
+DEFAULT_PORT = 9464
+DEFAULT_HOST = "127.0.0.1"
+
+
+class Settings(NamedTuple):
+    url: str
+    token: str
+    host: str
+    port: int
+    timeout: float
+
+
+# The scrape timeout this source timeout must stay under. Prometheus's own default, and
+# the figure the README's headroom argument is written against: a source timeout at or
+# above it cannot fail before the scrape does, so the failure lands as a scrape timeout
+# with no samples instead of as scrape_success 0 with telemetry.
+SCRAPE_TIMEOUT_CEILING = 10.0
+
+
+def _refuse(message: str):
+    return SystemExit(f"technocore-exporter: {message}")
+
+
+def _seconds(raw: str) -> float:
+    """A timeout from the environment, or refuse to start.
+
+    Same reasoning core states for `config._finite_env`: `int()` raises on junk and takes
+    the process down, which is the loudest way to report bad configuration, while
+    `float()` accepts `inf` and `nan` happily. Here the consequence is specific and worse
+    than a wrong number. A negative or NaN value raises ValueError from `socket.settimeout`
+    and `inf` raises OverflowError — on *every* scrape, not at boot — and `collect()` now
+    deliberately converts any unexpected exception into `scrape_success 0`. So a typo in
+    this knob would produce a process that starts, stays up, answers /metrics forever and
+    can never once succeed. Refusing at boot is the difference between a visible
+    misconfiguration and an exporter that looks alive and is not.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise _refuse(f"TECHNOCORE_STATS_TIMEOUT must be a number, got {raw!r}") from None
+    if not math.isfinite(value):
+        raise _refuse(f"TECHNOCORE_STATS_TIMEOUT must be finite, got {raw!r}")
+    if value <= 0:
+        # 0 is refused too: socket.settimeout accepts it, but it means non-blocking, so
+        # every scrape fails instantly. Accepted-but-always-failing is the case this
+        # function exists to prevent.
+        raise _refuse(f"TECHNOCORE_STATS_TIMEOUT must be greater than 0, got {raw!r}")
+    if value >= SCRAPE_TIMEOUT_CEILING:
+        raise _refuse(
+            f"TECHNOCORE_STATS_TIMEOUT must be below {SCRAPE_TIMEOUT_CEILING}s so a slow "
+            f"origin reports a failed scrape rather than timing out the scrape, got {raw!r}"
+        )
+    return value
+
+
+def _port(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise _refuse(f"TECHNOCORE_EXPORTER_PORT must be an integer, got {raw!r}") from None
+    if not 1 <= value <= 65535:
+        raise _refuse(f"TECHNOCORE_EXPORTER_PORT must be 1-65535, got {raw!r}")
+    return value
+
+
+def _url(raw: str) -> str:
+    """Refuse a URL the fetch could only fail on, for the same reason as the timeout.
+
+    `urllib.request.Request` raises ValueError for an unknown scheme at *request* time,
+    which the broad catch in collect() would render as a permanently failing scrape.
+    """
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise _refuse(f"TECHNOCORE_STATS_URL must be an http(s) URL, got {raw!r}")
+    if parsed.username or parsed.password:
+        # Refused rather than stripped, and the value is not echoed. `describe()` puts this
+        # URL in the startup log, so `http://user:secret@host/stats` would write a second
+        # credential to the very place the stats token is kept out of. /stats authenticates
+        # with X-Stats-Token and nothing else, so URL credentials could only ever be a
+        # mistake — and one worth naming rather than silently discarding.
+        raise _refuse("TECHNOCORE_STATS_URL must not embed credentials; use the token")
+    return raw
+
+
+def settings(env: dict[str, str] | None = None) -> Settings:
+    """Read configuration, refusing anything that could only fail later.
+
+    Every value here is checked at boot rather than at first use. The token comes from the
+    environment only: there is no `--token` flag on purpose, because an argv token is
+    readable from `ps` by every other user on the host, and this token is the whole gate on
+    the digest.
+
+    The host defaults to loopback for the other half of that: the digest is token-gated at
+    the origin, but /metrics is not gated at all and carries the same numbers.
+    """
+    source = os.environ if env is None else env
+    token = source.get("TECHNOCORE_STATS_TOKEN", "")
+    if not token:
+        raise _refuse(
+            "TECHNOCORE_STATS_TOKEN is not set. It must match the service's "
+            "CHAT_STATS_TOKEN; without it /stats answers 404."
+        )
+    return Settings(
+        url=_url(source.get("TECHNOCORE_STATS_URL", DEFAULT_URL)),
+        token=token,
+        host=source.get("TECHNOCORE_EXPORTER_HOST", DEFAULT_HOST),
+        port=_port(source.get("TECHNOCORE_EXPORTER_PORT", str(DEFAULT_PORT))),
+        timeout=_seconds(source.get("TECHNOCORE_STATS_TIMEOUT", str(DEFAULT_TIMEOUT))),
+    )
+
+
+def build(config: Settings, registry=REGISTRY) -> TechnocoreCollector:
+    """Register the collector. Separate from main() so a test can assert what was wired."""
+    collector = TechnocoreCollector(config.url, config.token, config.timeout)
+    registry.register(collector)
+    return collector
+
+
+def describe(config: Settings) -> str:
+    """The startup log line. Its own function because what it must NOT contain is a rule.
+
+    The URL is logged and the token never is, at any level — so this is asserted rather
+    than left to a reviewer noticing a future `%s` gaining an argument.
+    """
+    return f"serving /metrics on {config.host}:{config.port}, reading {config.url}"
+
+
+def main() -> None:  # pragma: no cover - the serve loop; its parts are tested above
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    config = settings()
+    build(config)
+    start_http_server(config.port, addr=config.host)
+    log.info("%s", describe(config))
+    while True:
+        time.sleep(3600)

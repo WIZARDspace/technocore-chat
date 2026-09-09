@@ -1,0 +1,16 @@
+# Scrape configuration for technocore-exporter.
+#
+# 60s, matching the service's CHAT_STATS_CACHE_SECONDS default. The digest behind /stats is
+# an O(cap) walk, cached for that long precisely so it is not rebuilt per request; scraping
+# faster returns the same cached bytes and buys no freshness at all. If an operator raises
+# CHAT_STATS_CACHE_SECONDS, raise this with it — a scrape interval below the cache is how
+# monitoring starts paying for a walk it cannot use.
+scrape_configs:
+  - job_name: technocore
+    scrape_interval: 60s
+    # Comfortably above the exporter's own 10s origin timeout, so a slow origin surfaces as
+    # technocore_exporter_scrape_success=0 rather than as a scrape timeout with no samples
+    # at all — the second tells you nothing about which side is unwell.
+    scrape_timeout: 15s
+    static_configs:
+      - targets: ["127.0.0.1:9464"]

@@ -1,0 +1,36 @@
+# One capacity alert, plus the collection alert that has to exist beside it.
+#
+# The pair is the point: a rule that fires on room pressure is worthless if a broken token
+# silently stops the samples, because "no data" and "no rooms" render identically. So the
+# first rule watches the exporter and the second watches the service.
+groups:
+  - name: technocore
+    rules:
+      - alert: TechnocoreMetricsStale
+        # `absent()` covers the exporter being down; the success gauge covers it being up
+        # and unable to read /stats — a wrong CHAT_STATS_TOKEN is the common cause, and it
+        # answers 404, so nothing about it looks like an authentication failure.
+        expr: absent(technocore_exporter_scrape_success) or technocore_exporter_scrape_success == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "technocore metrics are not being collected"
+          description: >-
+            The exporter is down, or it cannot read /stats. Check TECHNOCORE_STATS_TOKEN
+            against the service's CHAT_STATS_TOKEN: a mismatch answers 404, not 401.
+
+      - alert: TechnocoreRoomCapacityPressure
+        # Rooms, not bytes: the room cap is the one that refuses creates outright. Bytes
+        # have their own budget and a reaper working against them, so they warrant a
+        # separate, lower-urgency rule an operator can tune to their disk.
+        expr: technocore_rooms / technocore_rooms_capacity > 0.85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "technocore room occupancy above 85% of cap"
+          description: >-
+            {{ $value | humanizePercentage }} of the room cap is in use. New rooms are
+            refused at the cap. Note this counts unlisted rooms, which GET /rooms does not
+            show — so the listing will look emptier than this number.

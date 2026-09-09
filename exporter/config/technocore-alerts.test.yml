@@ -1,0 +1,90 @@
+# promtool unit tests for technocore-alerts.yml.
+#
+# A rules file that parses is not a rules file that fires. These pin both directions for
+# each alert — that it fires on the condition, and that it stays quiet otherwise — because
+# a capacity alert nobody has seen fire is indistinguishable from one that cannot.
+#
+#   promtool test rules exporter/config/technocore-alerts.test.yml
+rule_files:
+  - technocore-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    name: room occupancy crossing the cap threshold
+    input_series:
+      # 4352/5120 = 85%, exactly at the boundary and therefore NOT over it, then 4608 = 90%.
+      - series: technocore_rooms
+        values: "4352+0x20 4608+0x20"
+      - series: technocore_rooms_capacity
+        values: "5120+0x40"
+      - series: technocore_exporter_scrape_success
+        values: "1+0x40"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TechnocoreRoomCapacityPressure
+        exp_alerts: []  # exactly 85% is not "> 0.85"
+      - eval_time: 21m
+        alertname: TechnocoreRoomCapacityPressure
+        exp_alerts: []  # over the line, but not yet for 15m
+      - eval_time: 37m
+        alertname: TechnocoreRoomCapacityPressure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "technocore room occupancy above 85% of cap"
+              description: >-
+                90% of the room cap is in use. New rooms are refused at the cap. Note this
+                counts unlisted rooms, which GET /rooms does not show — so the listing will
+                look emptier than this number.
+
+  - interval: 1m
+    name: collection breaks while the service is fine
+    input_series:
+      # The service is healthy and far from its cap; only the exporter's read fails. The
+      # capacity alert must stay quiet and the staleness alert must fire.
+      - series: technocore_rooms
+        values: "10+0x30"
+      - series: technocore_rooms_capacity
+        values: "5120+0x30"
+      - series: technocore_exporter_scrape_success
+        values: "1 1 1 0+0x27"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: TechnocoreMetricsStale
+        exp_alerts: []  # failing, but not yet for 5m
+      - eval_time: 10m
+        alertname: TechnocoreMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "technocore metrics are not being collected"
+              description: >-
+                The exporter is down, or it cannot read /stats. Check TECHNOCORE_STATS_TOKEN
+                against the service's CHAT_STATS_TOKEN: a mismatch answers 404, not 401.
+      - eval_time: 10m
+        alertname: TechnocoreRoomCapacityPressure
+        exp_alerts: []
+
+  - interval: 1m
+    name: the exporter disappearing entirely
+    input_series:
+      # No technocore_exporter_scrape_success series at all — the absent() half. This is
+      # the case a bare `== 0` rule misses, and it is the likelier one: a dead exporter
+      # stops publishing rather than publishing a zero.
+      - series: technocore_rooms
+        values: "10+0x30"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TechnocoreMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "technocore metrics are not being collected"
+              description: >-
+                The exporter is down, or it cannot read /stats. Check TECHNOCORE_STATS_TOKEN
+                against the service's CHAT_STATS_TOKEN: a mismatch answers 404, not 401.
