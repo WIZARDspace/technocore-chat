@@ -19,13 +19,25 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import time
 import urllib.error
 import urllib.request
 
 # Below Prometheus's common 10s scrape_timeout, so a slow origin surfaces as a failed
 # scrape with telemetry rather than as a scrape timeout with no samples at all — the
 # second says nothing about which side is unwell.
+#
+# This is a budget for the whole call, not a socket option. `urlopen(timeout=)` bounds each
+# individual socket operation, so an origin that trickles a byte at a time never trips it:
+# measured at 20.01s for one fetch on this default, with no concurrency at all. The
+# deadline in `_read_within` is what makes the figure above mean what this comment says.
 DEFAULT_TIMEOUT = 5.0
+
+# One `recv` worth of body per iteration of the read loop. `read1` is deliberate: `read`
+# blocks until it has the full count, which collapses the deadline check below into a
+# single unbounded wait, while `read1` returns whatever one socket read produced and hands
+# control back to the loop.
+CHUNK_BYTES = 64 * 1024
 
 # A ceiling on what one scrape will read into memory. The digest is aggregates plus at most
 # 30h of five-minute samples — a few hundred KB at the very top end — so this is orders of
@@ -131,24 +143,72 @@ def validate(payload: dict) -> dict:
     return payload
 
 
+def _rearm(response, remaining: float) -> None:
+    """Point the response's socket timeout at what is left of the budget.
+
+    Re-derived from the response every call rather than cached: `HTTPResponse.fp` is set to
+    None the moment the body is fully consumed, so a handle taken once raises AttributeError
+    on the last iteration of the loop below.
+
+    Best effort by design. The chain is private (`fp.raw._sock`), so if a future CPython
+    reshapes it this silently does nothing and the deadline check in `_read_within` still
+    bounds the read to one socket operation's overshoot — far better than the unbounded
+    read this replaces, and a great deal better than raising from inside the recovery path.
+    """
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if sock is not None:
+        sock.settimeout(max(0.0, remaining))
+
+
+def _read_within(response, deadline: float, limit: int) -> bytes:
+    """The body, or refuse — under a wall-clock deadline and a byte cap.
+
+    Two bounds, and they fail differently on purpose. The cap is about memory: an exporter
+    that can be made to exhaust it takes the observability down with the thing it was
+    watching. The deadline is about the scrape contract: `urlopen(timeout=)` bounds each
+    socket operation, not the call, so an origin sending one byte per second under the
+    timeout keeps this alive indefinitely while Prometheus gives up at `scrape_timeout` and
+    stores nothing — no samples, and no failure telemetry either, which is the one outcome
+    the exporter exists to prevent.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StatsUnavailableError("exceeded the scrape budget while reading")
+        _rearm(response, remaining)
+        # One byte over the cap is enough to know it was exceeded, without reading the
+        # rest of whatever is being sent.
+        chunk = response.read1(min(CHUNK_BYTES, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > limit:
+        raise StatsUnavailableError(f"response exceeded {limit} bytes")
+    return b"".join(chunks)
+
+
 def fetch_stats(url: str, token: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     """Read and validate the JSON digest. Raises StatsUnavailableError for anything else.
+
+    `timeout` is the budget for this whole call — connect, headers and body together —
+    rather than the per-socket-operation timeout `urlopen` understands by itself. The
+    collector's guarantee that a slow origin reports `scrape_success 0` before Prometheus
+    abandons the scrape is only true if this returns within it.
 
     The token rides in `X-Stats-Token`, never in the URL: a query parameter would land in
     the proxy logs and in the exporter's own error text, and the service does not accept
     it there anyway.
     """
+    deadline = time.monotonic() + timeout
     request = urllib.request.Request(url, headers={"X-Stats-Token": token})
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             if response.status != 200:
                 raise StatsUnavailableError(f"status {response.status}")
-            # One byte over the cap is enough to know it was exceeded, without reading
-            # the rest of whatever is being sent.
-            raw = response.read(MAX_BODY_BYTES + 1)
-            if len(raw) > MAX_BODY_BYTES:
-                raise StatsUnavailableError(f"response exceeded {MAX_BODY_BYTES} bytes")
-            payload = json.loads(raw)
+            payload = json.loads(_read_within(response, deadline, MAX_BODY_BYTES))
     except urllib.error.HTTPError as exc:
         # 404 is what a wrong or unset token looks like — the endpoint reports itself
         # missing rather than forbidden, so an operator debugging this needs the hint.
@@ -165,12 +225,27 @@ def fetch_stats(url: str, token: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         # Split from URLError deliberately: a bare socket timeout is *not* a URLError and
         # has no `.reason`, so folding the two together raised AttributeError from inside
         # this handler — escaping StatsUnavailableError entirely.
-        raise StatsUnavailableError(f"timed out after {timeout}s") from None
+        # Formatted, because `timeout` is no longer the configured figure: the collector
+        # passes what is left of the budget after any queueing, so an unformatted float
+        # put `timed out after 8.99998889499966s` in the operator's log.
+        raise StatsUnavailableError(f"timed out after {timeout:.2f}s") from None
     except http.client.HTTPException as exc:
         # The sibling of the TimeoutError case above, and the same lesson: BadStatusLine,
         # IncompleteRead and RemoteDisconnected are raised while parsing a response and
         # are neither URLError nor TimeoutError, so without this they escape as themselves.
         raise StatsUnavailableError(f"protocol error: {type(exc).__name__}") from None
+    except OSError as exc:
+        # Last, and it is the point rather than a fourth guess. The three handlers above
+        # were each added after a specific class escaped as itself, and a third did anyway:
+        # `urllib` wraps what is raised while *opening* into URLError, but a socket that
+        # fails mid-body — ConnectionResetError on an RST — is raised raw, is not a
+        # URLError, not a TimeoutError and not an HTTPException.
+        #
+        # URLError and TimeoutError are both OSError subclasses, so this catches whatever
+        # the next one turns out to be without anyone having to have thought of it first.
+        # The handlers above still run first and still carry the better message; this one
+        # only has to make sure nothing socket-shaped leaves as itself.
+        raise StatsUnavailableError(f"transport error: {type(exc).__name__}") from None
     except ValueError:
         raise StatsUnavailableError("response was not JSON") from None
     if not isinstance(payload, dict):

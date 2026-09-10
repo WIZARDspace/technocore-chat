@@ -6,9 +6,12 @@ import http.client
 import http.server
 import io
 import json
+import socket
+import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -390,3 +393,122 @@ def test_the_token_never_reaches_a_redirect_target_end_to_end():
         for server in (sink, source):
             server.shutdown()
             server.server_close()
+
+
+# ---------------------------------------------- the budget, and what escapes a narrow catch
+
+
+def _raw_origin(respond):
+    """A socket server that answers exactly once, over a socket the test controls.
+
+    `http.server` cannot express either case below: one trickles a body slowly enough that
+    no single socket operation ever times out, and the other resets the connection
+    mid-body. Both need the socket itself, which is the whole point — a stub opener raising
+    a chosen exception can only ever prove that the exception someone already thought of is
+    handled.
+
+    Returns the port; the thread is a daemon and the listener closes with it.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+            conn.recv(65536)
+            respond(conn)
+        except OSError:  # pragma: no cover - the test finished first
+            pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1]
+
+
+def test_a_trickling_origin_cannot_outrun_the_scrape_budget():
+    """`urlopen(timeout=)` bounds one socket operation, not the call.
+
+    Reported as an overlapping-scrape problem by @Minh3132 and @yukkie3276; this is the
+    half that needs no concurrency at all. An origin sending one byte at a time, each
+    comfortably inside the timeout, never trips it — measured at 20.01s on the shipped 5s
+    default before the fix, against a Prometheus scrape_timeout of 15s. The scrape is
+    abandoned with no samples *and* no failure telemetry, which is the one outcome the
+    self-metrics exist to prevent.
+
+    Asserted as wall time rather than as the exception: the old code raised
+    StatsUnavailableError here too — eventually, and far too late for anyone to read it.
+    """
+    body = json.dumps(_valid()).encode()
+
+    def trickle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+        # Ten pauses of 0.4s, each far inside the 1.0s budget so no single socket
+        # operation ever times out, then the remainder. Bounded on purpose: without the
+        # fix this test has to *fail*, not hang, or a regression wedges CI instead of
+        # reporting. Pre-fix it returned the whole body after ~4s against a 1.0s budget.
+        for i in range(10):
+            time.sleep(0.4)
+            conn.sendall(body[i : i + 1])
+        conn.sendall(body[10:])
+
+    port = _raw_origin(trickle)
+    started = time.monotonic()
+    with pytest.raises(StatsUnavailableError):
+        fetch_stats(f"http://127.0.0.1:{port}/stats", "token", timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.5, f"a 1.0s budget took {elapsed:.2f}s"
+
+
+def test_a_connection_reset_mid_body_is_reported_not_raised_raw():
+    """The third transport family to escape a narrow handler, and the reason for `OSError`.
+
+    `urllib` wraps what is raised while *opening* into URLError, but an RST during the body
+    read surfaces as a bare ConnectionResetError: not a URLError, not a TimeoutError, not
+    an HTTPException. It escaped `fetch_stats` as itself, and only the collector's broad
+    catch kept /metrics off a 500 — at the cost of a traceback logged as "unexpected"
+    instead of a named failure.
+    """
+    body = json.dumps(_valid()).encode()
+
+    def reset(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % (len(body) + 4096))
+        conn.sendall(body[:64])
+        time.sleep(0.05)
+        # SO_LINGER with a zero timeout makes close() send RST rather than FIN, which is
+        # what raises in the peer's recv. A clean FIN is a different case: it truncates the
+        # body, and JSON refuses it on its own.
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        conn.close()
+
+    port = _raw_origin(reset)
+    with pytest.raises(StatsUnavailableError, match="transport error: ConnectionResetError"):
+        fetch_stats(f"http://127.0.0.1:{port}/stats", "token", timeout=5.0)
+
+
+def test_the_budget_holds_even_if_the_socket_cannot_be_re_armed(monkeypatch):
+    """`_rearm` reaches through a private chain (`fp.raw._sock`), so it may stop working.
+
+    When it works, the socket itself raises at the deadline and the loop's own check never
+    runs — which would leave the fallback untested and free to rot until the CPython
+    release that needs it. Neutering `_rearm` is what drives it: the deadline check in
+    `_read_within` still has to bound the read, to one socket operation's overshoot rather
+    than to nothing at all.
+    """
+    monkeypatch.setattr("technocore_exporter.fetch._rearm", lambda response, remaining: None)
+    body = json.dumps(_valid()).encode()
+
+    def trickle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+        for i in range(10):
+            time.sleep(0.3)
+            conn.sendall(body[i : i + 1])
+        conn.sendall(body[10:])
+
+    port = _raw_origin(trickle)
+    started = time.monotonic()
+    with pytest.raises(StatsUnavailableError, match="exceeded the scrape budget"):
+        fetch_stats(f"http://127.0.0.1:{port}/stats", "token", timeout=0.5)
+    elapsed = time.monotonic() - started
+    # One overshoot is the documented cost of losing the re-arm: the read in flight when
+    # the deadline passes still carries the full socket timeout. Bounded, not unbounded.
+    assert elapsed < 1.5, f"a 0.5s budget took {elapsed:.2f}s with no re-arm"

@@ -6,6 +6,7 @@ metric is worse than one that ships nothing, because an alert gets written again
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 
@@ -303,3 +304,131 @@ def test_overlapping_scrapes_are_serialised(stats, monkeypatch):
     assert not any(t.is_alive() for t in threads), "a scrape deadlocked"
     assert peak == 1, f"{peak} scrapes overlapped; the collector lock is not holding"
     assert collector._scrapes["success"] == 8
+
+
+def test_a_digest_with_no_stored_samples_publishes_no_sample_age(render, stats):
+    """A service that has never written a snapshot, which is every service on day one.
+
+    `app.py` builds the view as `{**service_stats, "history": store.snapshots(root)}` and
+    `snapshots()` returns [] until the first one is written, so this is the ordinary
+    fresh-deployment shape rather than a malformed digest. `history` is deliberately not in
+    REQUIRED — its absence is a fact about the service, not a broken read — so the scrape
+    must succeed and simply omit the age.
+
+    It was the one branch in the package no test drove; the storage gauges beside it are
+    what make the omission safe to leave silent.
+    """
+    text = render(payload={**stats, "history": []})
+    assert "technocore_stats_sample_age_seconds" not in text
+    assert _sample(text, "technocore_exporter_scrape_success") == 1
+    assert _sample(text, "technocore_rooms") == stats["rooms"]["total"]
+
+
+# --------------------------------------------------- the scrape budget, under contention
+
+
+def _hanging_origin():
+    """An origin that accepts and then says nothing at all. Returns its port.
+
+    A real socket, not a patched `fetch_stats`: the property under test is how long the
+    collector takes to answer, and a stub that sleeps proves only that a sleep sleeps.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    held = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:  # pragma: no cover - the test finished first
+                return
+            held.append(conn)  # kept open and unanswered
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1]
+
+
+def _race(collector, count=2):
+    """Drive `count` overlapping scrapes, returning (elapsed, families) for each in order."""
+    results = {}
+
+    def scrape(name, delay):
+        time.sleep(delay)
+        started = time.monotonic()
+        families = list(collector.collect())
+        results[name] = (time.monotonic() - started, families)
+
+    threads = [threading.Thread(target=scrape, args=(i, i * 0.05)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return [results[i] for i in range(count)]
+
+
+def _value(families, name, *labels):
+    """A sample by its exposed name — `technocore_exporter_scrapes_total`, not the family
+    name `technocore_exporter_scrapes` the client library derives it from."""
+    for family in families:
+        for sample in family.samples:
+            if sample.name == name and tuple(sample.labels.values()) == labels:
+                return sample.value
+    raise AssertionError(f"no sample {name}{labels or ''}")
+
+
+def test_a_queued_scrape_still_answers_inside_the_budget():
+    """Reported by @Minh3132 and @yukkie3276, on the same head, half an hour apart.
+
+    `_gather` serialises scrapes, and the wait was time the source timeout never saw: a
+    second scrape waited a full timeout for the lock and then spent another one on its own
+    fetch. Measured at 17.82s for a 9s timeout — past the shipped `scrape_timeout: 15s`, so
+    Prometheus abandoned it and stored neither samples nor the `scrape_success 0` the wait
+    had just produced. One deadline now covers the wait and the fetch together.
+    """
+    collector = TechnocoreCollector(
+        f"http://127.0.0.1:{_hanging_origin()}/stats", "token", timeout=1.0
+    )
+    for elapsed, families in _race(collector):
+        assert _value(families, "technocore_exporter_scrape_success") == 0
+        assert elapsed < 1.5, f"a 1.0s budget took {elapsed:.2f}s"
+
+
+def test_the_published_duration_is_the_time_the_scrape_actually_took():
+    """The metric that would have shown the queueing was the metric blind to it.
+
+    `started` was taken after the fetch lock was won, so the queued scrape published
+    `scrape_duration_seconds 9.01` for a scrape that took 17.82s to answer. An operator
+    watching the duration could not see the wait that was busting their scrape timeout.
+    Taking `started` before the acquire is what makes this number the answer time.
+    """
+    collector = TechnocoreCollector(
+        f"http://127.0.0.1:{_hanging_origin()}/stats", "token", timeout=1.0
+    )
+    for elapsed, families in _race(collector):
+        published = _value(families, "technocore_exporter_scrape_duration_seconds")
+        assert abs(published - elapsed) < 0.25, (
+            f"published {published:.2f}s for a scrape that took {elapsed:.2f}s"
+        )
+
+
+def test_a_scrape_that_never_wins_the_lock_still_reports_inside_the_budget():
+    """The far end of the queue: a scrape that cannot get the lock at all.
+
+    Driven by holding `_fetching` outright rather than by racing two slow origins, because
+    the property is "the wait is bounded" and a race can only ever demonstrate the waits it
+    happened to produce. Without the bound this call blocks for as long as the holder does
+    — indefinitely — and Prometheus abandons it long before it answers.
+    """
+    collector = TechnocoreCollector("http://origin.invalid/stats", "token", timeout=0.5)
+    collector._fetching.acquire()
+    try:
+        started = time.monotonic()
+        families = list(collector.collect())
+        elapsed = time.monotonic() - started
+    finally:
+        collector._fetching.release()
+    assert _value(families, "technocore_exporter_scrape_success") == 0
+    assert _value(families, "technocore_exporter_scrapes_total", "error") == 1
+    assert elapsed < 1.0, f"a 0.5s budget took {elapsed:.2f}s waiting for the lock"

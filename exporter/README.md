@@ -32,7 +32,32 @@ quietly widen this endpoint.
 | `TECHNOCORE_STATS_URL` | `http://127.0.0.1:8080/stats` | |
 | `TECHNOCORE_EXPORTER_HOST` | `127.0.0.1` | |
 | `TECHNOCORE_EXPORTER_PORT` | `9464` | |
-| `TECHNOCORE_STATS_TIMEOUT` | `5` | seconds; must be finite and `0 < t < 10` — **enforced at boot**, not described. Below Prometheus's own default `scrape_timeout` so a slow origin reports a failed scrape instead of the scrape timing out with no samples |
+| `TECHNOCORE_STATS_TIMEOUT` | `5` | seconds; must be finite and `0 < t < 10` — **enforced at boot**, not described. The budget for the whole answer, not one socket operation: see below |
+
+### The timeout is a budget for the answer, not a socket option
+
+`TECHNOCORE_STATS_TIMEOUT` bounds the origin read *and* any time queued behind another
+scrape, so `/metrics` answers within it plus the exporter's own assembly — milliseconds;
+measured at 5.04–5.07s on the 5s default. That is what puts the ceiling below Prometheus's
+own default `scrape_timeout`, so a slow origin reports
+`technocore_exporter_scrape_success 0` while Prometheus is still listening, rather than
+timing out the scrape and storing nothing — which would say nothing about which side is
+unwell.
+
+It reads as an obvious property and was false in two separate ways, both reported by
+reviewers (@Minh3132, @yukkie3276) and both now pinned by regressions:
+
+- `urlopen(timeout=)` bounds each socket operation, not the call, so an origin trickling a
+  byte at a time under the timeout never tripped it — one fetch took **20.01s** on the 5s
+  default and the `GET /metrics` around it answered after **20.18s** reporting
+  `scrape_success 1`, with no concurrency involved. `fetch.py` now reads the body against a
+  deadline.
+- Scrapes serialise on one lock, and the wait was time the timeout never saw: a queued
+  scrape spent a full timeout waiting and another on its own fetch — **17.82s for a 9s
+  timeout**, past a 15s `scrape_timeout`. `collector.py` now spends one deadline on the
+  wait and the fetch together, and publishes the wait in
+  `technocore_exporter_scrape_duration_seconds`, which previously reported 9.01s for that
+  same 17.82s scrape.
 
 ### Configuration is validated at boot, not at first scrape
 
@@ -40,9 +65,17 @@ Every setting above is checked before the server starts, and an unusable one ref
 boot rather than being accepted. That is not tidiness: `collect()` converts any unexpected
 error into `scrape_success 0`, so a timeout of `-1`, `nan` or `inf` — each of which raises
 from `socket.settimeout` on *every* request — would otherwise produce a process that
-starts, stays up, answers `/metrics` forever and never once succeeds. The same applies to a
-port out of range and to a URL whose scheme `urllib` cannot open. Core takes the same
+starts, stays up, answers `/metrics` forever and never once succeeds. Core takes the same
 position for the same reason; see `config._finite_env`.
+
+The same rule covers the rest, and each of these was once accepted at boot: a port out of
+range, a URL whose scheme `urllib` cannot open, a URL whose **port** it cannot
+(`http://host:notaport/stats` booted and then failed every scrape), a URL malformed enough
+that `urlparse` itself raises (`http://[::1/stats` exited with a traceback rather than a
+refusal), and a token that is only whitespace (truthy, so it booted and took 404 forever).
+Every one now refuses with a message naming the variable. The token's value is *not*
+trimmed, only tested — core compares `CHAT_STATS_TOKEN` unstripped, so a token whose
+surrounding whitespace is real has to be sent exactly as configured.
 
 ## Metrics
 
@@ -138,10 +171,22 @@ cache miss is the expensive thing monitoring must not trigger repeatedly.
 
 ```bash
 uv run pytest tests/exporter -q
-uv run --project exporter python -m technocore_exporter > /tmp/m.txt   # or scrape it
+
+# The exporter serves /metrics; it prints nothing. Scrape it from a second shell — the
+# recipe here used to redirect the process's stdout, which is empty, and then hand
+# `promtool check metrics` an empty file that it passes.
+uv run --project exporter technocore-exporter &
+curl -sf 127.0.0.1:9464/metrics > /tmp/m.txt
 promtool check metrics < /tmp/m.txt
+
 promtool check rules exporter/config/technocore-alerts.yml
+(cd exporter/config && promtool test rules technocore-alerts.test.yml)
 ```
+
+`test rules` is the one that matters of the two: `check rules` only says the file parses,
+while `test rules` unit-tests both alerts in both directions — including the exactly-85%
+boundary that must *not* fire, and the `absent()` case a bare `== 0` rule would miss. It
+runs from `exporter/config` because the test file names its rule file relatively.
 
 The suite validates the exposition through the client library's own parser on every run, so
 `promtool` is a second opinion rather than the only one.

@@ -193,17 +193,29 @@ class TechnocoreCollector(Collector):
         self._scrapes = {"success": 0, "error": 0}
         self._last_success = 0.0
         # `start_http_server` runs a ThreadingWSGIServer, so two overlapping scrapes call
-        # collect() on this one instance concurrently. Without the lock the counter bumps
-        # below are an unguarded read-modify-write and one is silently lost — the same
-        # shape as the `_buckets` race in core's limiter.
+        # collect() on this one instance concurrently.
         #
-        # It serialises; it does not coalesce. The second scrape still makes its own origin
-        # request once it holds the lock, so the guarantee is at most one request in flight
-        # per process, not one request per pair of overlapping scrapes — and a scrape that
-        # arrives while a slow read is running waits for it, so /metrics can take up to two
-        # timeouts to answer. Deduplicating instead would mean serving one scrape a sample
-        # fetched for another, which is a worse trade for a 60s scrape interval.
-        self._lock = threading.Lock()
+        # Two locks, because they are held for wildly different lengths of time. `_fetching`
+        # spans a whole origin read and is acquired with a bound; `_state` guards the
+        # counter bumps and is held for a few instructions. Folding them into one made the
+        # failure path — which has to bump a counter precisely when it could not get the
+        # fetch lock — unable to do so safely.
+        #
+        # `_fetching` serialises; it does not coalesce. The second scrape still makes its
+        # own origin request once it holds the lock, so the guarantee is at most one request
+        # in flight per process, not one request per pair of overlapping scrapes.
+        # Deduplicating instead would mean serving one scrape a sample fetched for another,
+        # which is a worse trade at a 60s scrape interval.
+        #
+        # What it must never do is push a scrape past the budget. Waiting here is time the
+        # source timeout does not see, so an unbounded wait plus a full fetch took a second
+        # scrape to ~2x the timeout — past Prometheus's scrape_timeout, which then stores
+        # neither samples nor the failure telemetry the wait produced (reported by
+        # @Minh3132 and @yukkie3276). `_gather` bounds the wait and the fetch against one
+        # deadline instead, so a queued scrape reports failure inside the budget rather than
+        # succeeding after nobody is listening.
+        self._fetching = threading.Lock()
+        self._state = threading.Lock()
 
     def collect(self) -> Iterable:
         """Yield the page. Never raises — see _gather."""
@@ -218,36 +230,68 @@ class TechnocoreCollector(Collector):
         in it escaped and the client library answered /metrics with a 500. Building the
         families inside the guard is what makes "no failure escapes" true of the mapping
         as well as the transport.
+
+        One deadline covers everything after `started`, waiting for the fetch lock
+        included. That is what makes the ceiling in server.py an actual bound: whatever
+        else happens, this returns within the configured source timeout, so the failure it
+        reports arrives while Prometheus is still listening for it.
         """
-        with self._lock:
-            started = time.monotonic()
-            try:
-                payload = fetch_stats(self._url, self._token, self._timeout)
-                families = [
-                    *_rooms(payload.get("rooms", {})),
-                    *_capacity(payload),
-                    *_counters(payload.get("counters", {})),
-                    *self._sample_age(payload),
-                ]
-            except StatsUnavailableError:
-                # No re-raise and no detail in a metric: a failed scrape is reported as
-                # success=0 and an error count, and the reason goes to the log. Encoding
-                # it as a label value would let the origin's failure mode drive the labels.
-                self._scrapes["error"] += 1
-                return list(self._self_metrics(time.monotonic() - started, ok=False))
-            except Exception:
-                # Deliberately broad, and the narrow handlers in fetch.py are still the
-                # real answer. This is the structural one: a scrape that receives a 500
-                # learns nothing, not even that the exporter is alive. Two transport
-                # families have already escaped a narrow handler here (a bare socket
-                # timeout, and http.client.HTTPException), so the assumption that any such
-                # list is complete has been wrong twice.
-                log.exception("unexpected error reading %s", self._url)
-                self._scrapes["error"] += 1
-                return list(self._self_metrics(time.monotonic() - started, ok=False))
+        started = time.monotonic()
+        deadline = started + self._timeout
+        if not self._fetching.acquire(timeout=self._timeout):
+            # Queued behind a scrape that used the whole budget. Reported as a failure
+            # rather than waited out: past here there is no time left to read the origin
+            # in, and an answer after the scrape timeout is worth less than a fast 0.
+            return self._failed(started, "timed out waiting for the in-flight scrape")
+        try:
+            # Clamped rather than checked for exhaustion: a scrape that wins the lock with
+            # nothing left gets a zero timeout, which is a non-blocking socket, which fails
+            # immediately and is published as scrape_success 0 inside the budget — the same
+            # answer an explicit branch here would produce, without a branch that only the
+            # clock can reach and no test can honestly cover.
+            remaining = max(0.0, deadline - time.monotonic())
+            payload = fetch_stats(self._url, self._token, remaining)
+            families = [
+                *_rooms(payload.get("rooms", {})),
+                *_capacity(payload),
+                *_counters(payload.get("counters", {})),
+                *self._sample_age(payload),
+            ]
+        except StatsUnavailableError as exc:
+            # No re-raise and no detail in a metric: a failed scrape is reported as
+            # success=0 and an error count, and the reason goes to the log. Encoding
+            # it as a label value would let the origin's failure mode drive the labels.
+            return self._failed(started, str(exc))
+        except Exception:
+            # Deliberately broad, and the narrow handlers in fetch.py are still the
+            # real answer. This is the structural one: a scrape that receives a 500
+            # learns nothing, not even that the exporter is alive. Three transport
+            # families have now escaped a narrow handler here (a bare socket timeout,
+            # http.client.HTTPException, and ConnectionResetError mid-body), so the
+            # assumption that any such list is complete has been wrong three times.
+            log.exception("unexpected error reading %s", self._url)
+            return self._failed(started, None)
+        finally:
+            self._fetching.release()
+        with self._state:
             self._scrapes["success"] += 1
             self._last_success = time.time()
-            return families + list(self._self_metrics(time.monotonic() - started, ok=True))
+        return families + list(self._self_metrics(time.monotonic() - started, ok=True))
+
+    def _failed(self, started: float, reason: str | None) -> list:
+        """Failure telemetry alone, and the count that goes with it.
+
+        `started` is taken before the fetch lock, so the duration published here includes
+        any time spent queued. That is deliberate: the queueing is what pushed a scrape
+        past the budget, and a duration measured from the moment the lock was won reported
+        9.01s for a scrape that took 17.82s — the one metric that would have shown the
+        problem was the one metric blind to it.
+        """
+        if reason:
+            log.warning("scrape of %s failed: %s", self._url, reason)
+        with self._state:
+            self._scrapes["error"] += 1
+        return list(self._self_metrics(time.monotonic() - started, ok=False))
 
     def _sample_age(self, payload: dict) -> Iterable:
         """Age of the newest stored sample.
@@ -287,7 +331,14 @@ class TechnocoreCollector(Collector):
         Without these, a broken token is indistinguishable from a service with no rooms:
         both render as an absence of samples, and `absent()` alerts are the ones people
         forget to write.
+
+        The counters are snapshotted under `_state` rather than read field by field while
+        yielding: this runs outside the fetch lock now, so another scrape can bump them
+        between two of the families below and publish a page that disagrees with itself.
         """
+        with self._state:
+            last_success = self._last_success
+            counts = dict(self._scrapes)
         yield GaugeMetricFamily(
             "technocore_exporter_scrape_success",
             "1 if the most recent /stats read succeeded, 0 otherwise.",
@@ -295,13 +346,14 @@ class TechnocoreCollector(Collector):
         )
         yield GaugeMetricFamily(
             "technocore_exporter_scrape_duration_seconds",
-            "Wall time of the most recent /stats read.",
+            "Wall time of the most recent /stats read, including any time queued behind "
+            "another scrape. Bounded by TECHNOCORE_STATS_TIMEOUT.",
             value=duration,
         )
         yield GaugeMetricFamily(
             "technocore_exporter_last_success_timestamp_seconds",
             "Unix time of the last successful /stats read; 0 if there has not been one.",
-            value=self._last_success,
+            value=last_success,
         )
         scrapes = CounterMetricFamily(
             "technocore_exporter_scrapes",
@@ -309,5 +361,5 @@ class TechnocoreCollector(Collector):
             labels=["outcome"],
         )
         for outcome in ("success", "error"):
-            scrapes.add_metric([outcome], self._scrapes[outcome])
+            scrapes.add_metric([outcome], counts[outcome])
         yield scrapes

@@ -13,6 +13,12 @@ scrape_configs:
     # a slow origin always surfaces as technocore_exporter_scrape_success=0 with telemetry
     # rather than as a scrape timeout with no samples at all — the second tells you nothing
     # about which side is unwell.
+    #
+    # That holds because the exporter treats the timeout as a budget for the origin read
+    # plus any time queued behind another scrape, not as a per-socket-operation timeout. It
+    # did not always: against a trickling origin on the 5s default, GET /metrics answered
+    # after 20.18s reporting success, and a scrape queued behind another took 17.82s on a
+    # 9s timeout — both past this figure. See the exporter README.
     scrape_timeout: 15s
     static_configs:
       - targets: ["127.0.0.1:9464"]

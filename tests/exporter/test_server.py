@@ -29,7 +29,7 @@ def test_a_missing_token_stops_the_process_with_the_reason():
 
 
 def test_an_empty_token_counts_as_missing():
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit, match="TECHNOCORE_STATS_TOKEN is not set"):
         settings(env={"TECHNOCORE_STATS_TOKEN": ""})
 
 
@@ -112,14 +112,58 @@ def test_an_unusable_port_is_refused_at_boot(raw):
 
 @pytest.mark.parametrize(
     "raw",
-    ["", "not a url", "ftp://host/stats", "file:///etc/passwd", "/stats", "http:///stats"],
+    [
+        "",
+        "not a url",
+        "ftp://host/stats",
+        "file:///etc/passwd",
+        "/stats",
+        "http:///stats",
+        # The port, which the scheme check does not see. `http://127.0.0.1:notaport/stats`
+        # parsed clean, booted clean, and then failed every scrape with `protocol error:
+        # InvalidURL` — accepted at boot and permanently unable to work, which is the exact
+        # outcome this validator exists to prevent.
+        "http://127.0.0.1:notaport/stats",
+        "http://127.0.0.1:99999/stats",
+        "http://127.0.0.1:0/stats",
+        # `urlparse` raises on this one before any check runs, so the process died with a
+        # traceback instead of the refusal every other setting here gets.
+        "http://[::1/stats",
+    ],
 )
 def test_an_unusable_stats_url_is_refused_at_boot(raw):
     """Same class as the timeout: `urllib.request.Request` raises for an unknown scheme at
     *request* time, which the broad catch in collect() would render as a permanently
-    failing scrape rather than as the configuration error it is."""
+    failing scrape rather than as the configuration error it is.
+
+    Every case here must reach `SystemExit` with the variable named. A traceback is not a
+    refusal: it is the same "unusable configuration" outcome reported in a way that does
+    not tell the operator which knob to fix.
+    """
     with pytest.raises(SystemExit, match="TECHNOCORE_STATS_URL"):
         settings(env={**TOKEN, "TECHNOCORE_STATS_URL": raw})
+
+
+@pytest.mark.parametrize("raw", [" ", "\t", "\n", "   "])
+def test_a_whitespace_only_token_counts_as_missing(raw):
+    """`TECHNOCORE_STATS_TOKEN=" "` is truthy, so it booted and 404ed forever.
+
+    Same shape as an unusable URL or timeout: accepted at boot, permanently unable to work.
+    A stray space in a unit file or a `.env` line is how it happens.
+    """
+    with pytest.raises(SystemExit, match="TECHNOCORE_STATS_TOKEN is only whitespace"):
+        settings(env={"TECHNOCORE_STATS_TOKEN": raw})
+
+
+def test_a_token_whose_whitespace_is_real_is_sent_unchanged():
+    """The other direction, and the reason the value is tested stripped but used raw.
+
+    Core reads CHAT_STATS_TOKEN without stripping and compares with `compare_digest`, so a
+    token with surrounding whitespace is one this must send exactly as configured.
+    Trimming it here would turn a working deployment into a silent 404.
+    """
+    config = settings(env={"TECHNOCORE_STATS_TOKEN": " padded "})
+    assert config.token == " padded "
 
 
 def test_the_usable_configuration_is_still_accepted():
@@ -222,3 +266,27 @@ def test_main_serves_the_registry_it_built(monkeypatch, stats):
     assert all(name.startswith("technocore_") for name in _served_names(body))
     for upstream in ("python_info", "process_resident_memory_bytes", "python_gc_objects"):
         assert upstream not in body, f"{upstream} reached the ungated page"
+
+
+def test_importing_the_module_entrypoint_does_not_start_the_server(monkeypatch):
+    """`__main__.py` ran `main()` at import, with no `if __name__` guard.
+
+    Anything that imports the package's submodules — a docs tool, `pkgutil.walk_packages`,
+    a packaging or coverage pass — therefore bound a port and never returned. The guard is
+    the stdlib convention; `mcp/` has no `__main__.py` to copy, so there was no in-repo
+    precedent to follow either.
+
+    Asserted through a real import rather than by reading the source for the guard, because
+    a source scan passes for a file that has the words in a comment.
+    """
+    import importlib
+
+    called = []
+    monkeypatch.setattr(
+        "technocore_exporter.server.main", lambda: called.append(True), raising=True
+    )
+    # Reloaded rather than merely imported: the module may already be in sys.modules from
+    # an earlier test, and a cached import executes nothing at all — which would make this
+    # pass whether or not the guard is there.
+    importlib.reload(importlib.import_module("technocore_exporter.__main__"))
+    assert called == [], "importing __main__ ran main()"

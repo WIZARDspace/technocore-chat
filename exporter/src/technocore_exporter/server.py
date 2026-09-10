@@ -42,6 +42,13 @@ class Settings(NamedTuple):
 # the figure the README's headroom argument is written against: a source timeout at or
 # above it cannot fail before the scrape does, so the failure lands as a scrape timeout
 # with no samples instead of as scrape_success 0 with telemetry.
+#
+# This bounds the origin read, not one socket operation, and only because two other things
+# now hold: `_gather` spends one deadline on the lock wait and the fetch together, and
+# `_read_within` enforces it across a trickling body. Before those, this number bounded
+# nothing — against a trickling origin on the 5s default, one fetch took 20.01s and the
+# `GET /metrics` around it answered after 20.18s, reporting success — and the arithmetic
+# here was describing a guarantee the code did not make.
 SCRAPE_TIMEOUT_CEILING = 10.0
 
 
@@ -96,10 +103,24 @@ def _url(raw: str) -> str:
 
     `urllib.request.Request` raises ValueError for an unknown scheme at *request* time,
     which the broad catch in collect() would render as a permanently failing scrape.
+
+    Both the parse and the port are inside the guard, and each closed a hole of exactly the
+    kind this function exists to close. `urlparse` itself raises on a malformed IPv6 literal
+    (`http://[::1/stats`), so this took the process down with a traceback rather than the
+    stated refusal every other setting here gets. And a non-numeric or out-of-range port —
+    `http://127.0.0.1:notaport/stats` — parsed fine, booted fine, and then failed *every*
+    scrape with `protocol error: InvalidURL`: accepted at boot and permanently unable to
+    work, which is the one outcome validating configuration here is for.
     """
-    parsed = urllib.parse.urlparse(raw)
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        raise _refuse(f"TECHNOCORE_STATS_URL is not a usable URL, got {raw!r}") from None
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise _refuse(f"TECHNOCORE_STATS_URL must be an http(s) URL, got {raw!r}")
+    if port is not None and not 1 <= port <= 65535:
+        raise _refuse(f"TECHNOCORE_STATS_URL port must be 1-65535, got {raw!r}")
     if parsed.username or parsed.password:
         # Refused rather than stripped, and the value is not echoed. `describe()` puts this
         # URL in the startup log, so `http://user:secret@host/stats` would write a second
@@ -122,10 +143,23 @@ def settings(env: dict[str, str] | None = None) -> Settings:
     the origin, but /metrics is not gated at all and carries the same numbers.
     """
     source = os.environ if env is None else env
+    # Tested stripped, used raw. `TECHNOCORE_STATS_TOKEN=" "` is what a stray space in a
+    # unit file or a `.env` line looks like; it is truthy, so it booted, sent a space and
+    # took 404 from /stats forever — accepted at boot and permanently unable to work, the
+    # same shape as an unusable URL or timeout.
+    #
+    # The value itself is *not* stripped, deliberately. `config.STATS_TOKEN` in core reads
+    # CHAT_STATS_TOKEN without stripping and compares with `secrets.compare_digest`, so a
+    # token whose surrounding whitespace is real is a token this must send unchanged.
+    # Trimming here would turn one operator's working configuration into a silent 404.
     token = source.get("TECHNOCORE_STATS_TOKEN", "")
-    if not token:
+    if not token.strip():
+        # Two messages, because they send the operator to different places. "Is not set"
+        # is wrong for `TOKEN=" "` — the variable is set, and being told it is not sends
+        # someone to check the thing they can already see is there.
+        what = "is not set" if not token else "is only whitespace"
         raise _refuse(
-            "TECHNOCORE_STATS_TOKEN is not set. It must match the service's "
+            f"TECHNOCORE_STATS_TOKEN {what}. It must match the service's "
             "CHAT_STATS_TOKEN; without it /stats answers 404."
         )
     return Settings(
