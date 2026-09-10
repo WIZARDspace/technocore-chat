@@ -20,6 +20,12 @@ uv run --project exporter technocore-exporter
 network.** The digest is token-gated at the origin; `/metrics` is not gated at all, and it
 is the same numbers.
 
+It is *only* those numbers. The exporter serves its own `CollectorRegistry`, not the client
+library's global one, so the page carries the families listed below and nothing else — no
+`python_info`, no `process_*`, no GC series. That is asserted on a rendered page in
+`tests/exporter/test_server.py`, so an upstream release adding default collectors cannot
+quietly widen this endpoint.
+
 | Variable | Default | |
 |---|---|---|
 | `TECHNOCORE_STATS_TOKEN` | — | required; read from the environment only, never a flag, because argv is world-readable via `ps` |

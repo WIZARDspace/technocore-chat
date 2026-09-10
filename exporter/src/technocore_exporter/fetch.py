@@ -36,9 +36,11 @@ DEFAULT_TIMEOUT = 5.0
 # made to exhaust memory takes the observability down with the thing it was watching.
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
-# Fields the mapping reads. A digest missing any of them is refused rather than mapped:
-# absent is not zero, and a note-capacity alert that reads 0 because the field was missing
-# is worse than no sample, because it will never fire.
+# Every field the mapping reads, plus `notes.bytes`, which it does not: the digest carries
+# the same number twice (`bytes.notes` is `note_stats()["bytes"]`) and a digest that has
+# only one of them is not the shape this was written against. A digest missing any of these
+# is refused rather than mapped: absent is not zero, and a note-capacity alert that reads 0
+# because the field was missing is worse than no sample, because it will never fire.
 REQUIRED = {
     "rooms": ("total", "listed", "unlisted", "open", "mailbox", "ownable", "ephemeral", "capacity"),
     "bytes": ("rooms", "notes", "rooms_capacity"),

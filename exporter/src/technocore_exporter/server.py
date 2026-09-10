@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from typing import NamedTuple
 
-from prometheus_client import REGISTRY, start_http_server
+from prometheus_client import CollectorRegistry, start_http_server
 
 from .collector import TechnocoreCollector
 from .fetch import DEFAULT_TIMEOUT
@@ -137,11 +137,35 @@ def settings(env: dict[str, str] | None = None) -> Settings:
     )
 
 
-def build(config: Settings, registry=REGISTRY) -> TechnocoreCollector:
-    """Register the collector. Separate from main() so a test can assert what was wired."""
+def build(config: Settings, registry: CollectorRegistry) -> TechnocoreCollector:
+    """Register the collector. Separate from main() so a test can assert what was wired.
+
+    `registry` has no default on purpose. It used to default to the client library's global
+    `REGISTRY`, which is not empty: importing `prometheus_client` pre-registers the process,
+    platform and GC collectors, so whatever this exporter served carried `python_info`,
+    `process_resident_memory_bytes`, `process_cpu_seconds`, `process_open_fds` and the GC
+    families beside ours (reported by @Minh3132). A default that quietly widens an
+    unauthenticated endpoint is the wrong default, so there is none.
+    """
     collector = TechnocoreCollector(config.url, config.token, config.timeout)
     registry.register(collector)
     return collector
+
+
+def build_registry(config: Settings) -> CollectorRegistry:
+    """The registry `/metrics` serves: this exporter's families and nothing else.
+
+    This is the call `main()` makes, so the boundary is decided in one testable place rather
+    than in the serve loop. Two claims depend on it and both are checkable from here: the
+    first-wave scope is what `store.service_stats` returns plus exporter self-metrics, and
+    the README tells operators that the ungated `/metrics` page carries the same numbers as
+    the token-gated digest. A process/runtime surface arriving from the library's global
+    default would contradict both, and would change with an upstream release rather than
+    with a change here.
+    """
+    registry = CollectorRegistry()
+    build(config, registry)
+    return registry
 
 
 def describe(config: Settings) -> str:
@@ -153,11 +177,14 @@ def describe(config: Settings) -> str:
     return f"serving /metrics on {config.host}:{config.port}, reading {config.url}"
 
 
-def main() -> None:  # pragma: no cover - the serve loop; its parts are tested above
+# no cover: the `while True` never completes, so the line after it can never be reached.
+# main() itself is exercised by test_main_serves_the_registry_it_built, which stubs the
+# serve call and the sleep — the pragma is about the loop, not about the wiring above it.
+def main() -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = settings()
-    build(config)
-    start_http_server(config.port, addr=config.host)
+    registry = build_registry(config)
+    start_http_server(config.port, addr=config.host, registry=registry)
     log.info("%s", describe(config))
     while True:
         time.sleep(3600)

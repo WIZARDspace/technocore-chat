@@ -1,8 +1,9 @@
 """Map the `/stats` digest onto Prometheus metric families.
 
-Scope is deliberately narrow: only what `store.service_stats` returns. Three things the
-digest carries are left out on purpose, and each omission is a decision rather than an
-oversight — see OMITTED below.
+Scope is deliberately narrow: only what `store.service_stats` returns. `/stats` carries
+five things this exporter does not publish — three from `service_stats` itself and two that
+`app.py` adds to the view — and each omission is a decision rather than an oversight; see
+OMITTED below.
 
 Naming follows the Prometheus conventions: gauges carry no `_total`, counters do (the
 client library appends it), and every byte figure is named `_bytes` because base units
@@ -53,6 +54,19 @@ _COUNTERS = {
 #          bounded-window sample rather than a service total. Publishing it beside real
 #          totals invites an alert on a number that does not mean what its neighbours
 #          mean.
+#
+# The last two are added to the view by `app.py`, not by `service_stats`, so they are
+# outside this package's stated scope by construction — named anyway, because "three
+# omissions" invites the reader to check and find five things in the digest:
+#
+# OMITTED: `capacity_limits` — request-shaping constants (message_chars, read_per_min and
+#          friends), not occupancy. The two that actually bound the aggregates here are
+#          already published from `service_stats`: `room_bytes_total` is the same constant
+#          as `bytes.rooms_capacity` (technocore_room_bytes_capacity) and MAX_ROOMS
+#          arrives as `rooms.capacity` (technocore_rooms_capacity).
+# OMITTED: `client_identity` — `distinct_identities` counts a module-level dict, so it is
+#          per *worker* for exactly the reason `requests` is, and `client_ip_header` is a
+#          configuration string rather than a measurement.
 
 
 def _rooms(rooms: dict) -> Iterable:
@@ -181,8 +195,14 @@ class TechnocoreCollector(Collector):
         # `start_http_server` runs a ThreadingWSGIServer, so two overlapping scrapes call
         # collect() on this one instance concurrently. Without the lock the counter bumps
         # below are an unguarded read-modify-write and one is silently lost — the same
-        # shape as the `_buckets` race in core's limiter. It also stops two scrapes from
-        # each opening their own origin request, which is the more expensive half.
+        # shape as the `_buckets` race in core's limiter.
+        #
+        # It serialises; it does not coalesce. The second scrape still makes its own origin
+        # request once it holds the lock, so the guarantee is at most one request in flight
+        # per process, not one request per pair of overlapping scrapes — and a scrape that
+        # arrives while a slow read is running waits for it, so /metrics can take up to two
+        # timeouts to answer. Deduplicating instead would mean serving one scrape a sample
+        # fetched for another, which is a worse trade for a 60s scrape interval.
         self._lock = threading.Lock()
 
     def collect(self) -> Iterable:

@@ -314,12 +314,31 @@ def test_an_oversized_body_is_refused_without_reading_it_all(monkeypatch):
         fetch_stats(URL, "token")
 
 
-def test_a_body_at_the_cap_is_still_read(monkeypatch):
-    """The boundary in the other direction, so the cap cannot pass by refusing everything."""
+def test_an_ordinary_digest_is_still_read(monkeypatch):
+    """The cap must not pass by refusing everything. A real digest is nowhere near it."""
     payload = json.dumps(_valid()).encode()
     assert len(payload) < 4096
     _patch(monkeypatch, _Response(payload))
     assert fetch_stats(URL, "token")["rooms"]["total"] == 0
+
+
+@pytest.mark.parametrize(("cap_delta", "refused"), [(0, False), (-1, True)])
+def test_the_body_cap_is_exact_at_its_boundary(monkeypatch, cap_delta, refused):
+    """Exactly at the cap is read; one byte over is refused.
+
+    Against a cap moved to the fixture's own length rather than against an 8 MiB body: the
+    boundary is what `read(MAX_BODY_BYTES + 1)` plus `len(raw) > MAX_BODY_BYTES` gets wrong
+    by one in either direction, and the previous pair of tests only covered "far under" and
+    "far over", where an off-by-one is invisible.
+    """
+    payload = json.dumps(_valid()).encode()
+    monkeypatch.setattr("technocore_exporter.fetch.MAX_BODY_BYTES", len(payload) + cap_delta)
+    _patch(monkeypatch, _Response(payload))
+    if refused:
+        with pytest.raises(StatsUnavailableError, match="exceeded"):
+            fetch_stats(URL, "token")
+    else:
+        assert fetch_stats(URL, "token")["rooms"]["total"] == 0
 
 
 def test_the_token_never_reaches_a_redirect_target_end_to_end():

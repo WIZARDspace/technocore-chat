@@ -168,6 +168,19 @@ def test_the_reap_reason_label_carries_both_values(render, stats):
     assert stats["counters"]["reaped_idle"] == 0
 
 
+def test_the_reap_reasons_are_not_transposed(render, stats):
+    """The fixture has both reap counters at 0, so no other test can tell them apart.
+
+    With `reaped_idle == reaped_stillborn == 0`, swapping the two values in `_REAP_REASONS`
+    passes every other assertion in this file — including the one above, which checks both
+    samples are 0. The mapping direction is pinned here against distinct numbers instead.
+    """
+    counters = {**stats["counters"], "reaped_idle": 7, "reaped_stillborn": 3}
+    text = render(payload={**stats, "counters": counters})
+    assert _sample(text, "technocore_rooms_reaped_total", reason="idle") == 7
+    assert _sample(text, "technocore_rooms_reaped_total", reason="stillborn") == 3
+
+
 def test_the_real_values_are_carried_through(render, stats):
     """The mapping itself, against the captured digest."""
     text = render()
@@ -260,8 +273,9 @@ def test_overlapping_scrapes_are_serialised(stats, monkeypatch):
     threads to interleave on exactly that bytecode. Depth is deterministic: if any two
     bodies ever overlap, the maximum observed depth is 2 and the test fails every time.
 
-    Serialising is wanted for its own sake too. It stops two overlapping scrapes each
-    opening their own origin request, which is the more expensive half of the race.
+    Serialising is not deduplicating, and the last assertion below is what says so: eight
+    threads produce eight successful reads, one after another. The lock bounds how many
+    origin requests are in flight at once, not how many are made.
     """
     import technocore_exporter.collector as module
 

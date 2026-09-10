@@ -8,9 +8,11 @@
 scrape_configs:
   - job_name: technocore
     scrape_interval: 60s
-    # Comfortably above the exporter's own 10s origin timeout, so a slow origin surfaces as
-    # technocore_exporter_scrape_success=0 rather than as a scrape timeout with no samples
-    # at all — the second tells you nothing about which side is unwell.
+    # Above every origin timeout the exporter will accept: TECHNOCORE_STATS_TIMEOUT
+    # defaults to 5s and is refused at boot unless 0 < t < 10 (SCRAPE_TIMEOUT_CEILING), so
+    # a slow origin always surfaces as technocore_exporter_scrape_success=0 with telemetry
+    # rather than as a scrape timeout with no samples at all — the second tells you nothing
+    # about which side is unwell.
     scrape_timeout: 15s
     static_configs:
       - targets: ["127.0.0.1:9464"]

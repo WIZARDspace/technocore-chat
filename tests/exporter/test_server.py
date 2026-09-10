@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from prometheus_client import CollectorRegistry
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 from technocore_exporter.fetch import DEFAULT_TIMEOUT
 from technocore_exporter.server import (
     DEFAULT_HOST,
@@ -11,7 +12,9 @@ from technocore_exporter.server import (
     DEFAULT_URL,
     SCRAPE_TIMEOUT_CEILING,
     build,
+    build_registry,
     describe,
+    main,
     settings,
 )
 
@@ -156,3 +159,66 @@ def test_the_refusal_does_not_echo_the_credential():
         assert "s3cret" not in str(exc)
     else:
         raise AssertionError("expected a refusal")
+
+
+# ------------------------------------ what the ungated page exposes, reported by @Minh3132
+
+
+def _served_names(body: str) -> set:
+    return {family.name for family in text_string_to_metric_families(body)}
+
+
+def test_the_served_registry_carries_only_our_families(monkeypatch, stats):
+    """The boundary, asserted on a rendered page rather than on the registration call.
+
+    `build` used to default to the client library's global `REGISTRY`, which arrives
+    pre-populated with the process, platform and GC collectors — so the ungated `/metrics`
+    page published `python_info`, `process_resident_memory_bytes` and friends alongside the
+    digest. Rendering the page is what makes that visible; asserting on what was registered
+    is not, because those families are registered by an import, not by this package.
+    """
+    monkeypatch.setattr("technocore_exporter.collector.fetch_stats", lambda *a, **k: stats)
+    config = settings(env={**TOKEN, "TECHNOCORE_STATS_URL": "https://chat.example/stats"})
+
+    body = generate_latest(build_registry(config)).decode()
+
+    names = _served_names(body)
+    assert names, "the served page is empty"
+    assert all(name.startswith("technocore_") for name in names), sorted(names)
+
+
+def test_main_serves_the_registry_it_built(monkeypatch, stats):
+    """The production wiring, not a stand-in for it.
+
+    A test that only renders `build_registry(config)` still passes if `main()` goes back to
+    calling `start_http_server` without a registry, because the library then serves its own
+    default and never consults ours. So this drives `main()` itself and asserts on the
+    registry the serve call actually received.
+    """
+    captured = {}
+
+    def fake_start(port, addr, registry):
+        captured.update(port=port, addr=addr, registry=registry)
+
+    def stop(*_args):
+        raise SystemExit
+
+    monkeypatch.setattr("technocore_exporter.server.start_http_server", fake_start)
+    monkeypatch.setattr("technocore_exporter.server.time.sleep", stop)
+    monkeypatch.setattr("technocore_exporter.collector.fetch_stats", lambda *a, **k: stats)
+    monkeypatch.setenv("TECHNOCORE_STATS_TOKEN", "s3cret-token")
+    monkeypatch.setenv("TECHNOCORE_STATS_URL", "https://chat.example/stats")
+    monkeypatch.setenv("TECHNOCORE_EXPORTER_PORT", "9999")
+    # main() reads the real environment. Cleared rather than trusted, so a developer who
+    # exports one of these for a live exporter does not get a failure from this file.
+    monkeypatch.delenv("TECHNOCORE_STATS_TIMEOUT", raising=False)
+    monkeypatch.delenv("TECHNOCORE_EXPORTER_HOST", raising=False)
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert (captured["port"], captured["addr"]) == (9999, DEFAULT_HOST)
+    body = generate_latest(captured["registry"]).decode()
+    assert all(name.startswith("technocore_") for name in _served_names(body))
+    for upstream in ("python_info", "process_resident_memory_bytes", "python_gc_objects"):
+        assert upstream not in body, f"{upstream} reached the ungated page"
