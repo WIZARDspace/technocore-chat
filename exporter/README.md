@@ -36,16 +36,20 @@ quietly widen this endpoint.
 
 ### The timeout is a budget for the answer, not a socket option
 
-`TECHNOCORE_STATS_TIMEOUT` bounds the origin read *and* any time queued behind another
-scrape, so `/metrics` answers within it plus the exporter's own assembly — milliseconds;
-measured at 5.04–5.07s on the 5s default. That is what puts the ceiling below Prometheus's
-own default `scrape_timeout`, so a slow origin reports
+`TECHNOCORE_STATS_TIMEOUT` bounds the whole scrape — name resolution, connect, headers,
+body, and any time queued behind another scrape — so `/metrics` answers within it plus the
+exporter's own assembly, which is milliseconds. That is what puts the ceiling below
+Prometheus's own default `scrape_timeout`, so a slow origin reports
 `technocore_exporter_scrape_success 0` while Prometheus is still listening, rather than
 timing out the scrape and storing nothing — which would say nothing about which side is
 unwell.
 
-It reads as an obvious property and was false in two separate ways, both reported by
-reviewers (@Minh3132, @yukkie3276) and both now pinned by regressions:
+It reads as an obvious property and has now been false in **five** separate ways, none of
+which this package's own tests caught. Two were reported directly by reviewers (@Minh3132,
+@yukkie3276); the other three came out of auditing the phase boundary each report exposed.
+Every one is now pinned by a regression. They share a cause worth
+stating plainly: `urlopen(timeout=)` is a bound on one socket operation, and a scrape is
+made of many.
 
 - `urlopen(timeout=)` bounds each socket operation, not the call, so an origin trickling a
   byte at a time under the timeout never tripped it — one fetch took **20.01s** on the 5s
@@ -58,6 +62,27 @@ reviewers (@Minh3132, @yukkie3276) and both now pinned by regressions:
   wait and the fetch together, and publishes the wait in
   `technocore_exporter_scrape_duration_seconds`, which previously reported 9.01s for that
   same 17.82s scrape.
+- Name resolution runs before there is a socket for the timeout to apply to, so a wedged
+  resolver blocked past it: **20.0s of a 3s budget** at `/metrics` — the scrape
+  answered when the resolver did, which is to say the budget bounded nothing.
+- Connect then tries *every* address the name resolved to, giving each the full timeout, so
+  the budget was spent once per address record rather than once per scrape: **12.0s of a
+  3s budget** across four blackholed A records — four times the budget, with each connect
+  logged at the whole 3.0s rather than a share. Two records is enough to matter, provided both *blackhole* rather
+  than refuse — a refused connection returns at once and costs nothing, while a firewall
+  that drops does not. At the ceiling of just under 10s, two dropping addresses reach ~20s
+  against a 15s `scrape_timeout`.
+- The status line and response headers are read before `urlopen` returns, so the deadline
+  in `_read_within` never saw them. An origin trickling one header byte per 0.5s ran to
+  **22.6s of a 3s budget**, and the exporter was still waiting when the origin stopped
+  trickling — so that figure is the origin's choice, not a bound. This one needs no hostname: it lands on the shipped `127.0.0.1` default,
+  because it is about what the origin sends rather than how it is addressed.
+
+The first two fixes bounded the phases this package could see. The last three are phases it
+could not, which is why the bound moved up a level: `TechnocoreCollector._fetch_within` runs
+the fetch on a worker and stops waiting at the deadline, whatever the transport is doing.
+The worker keeps the fetch lock when it is abandoned, so a wedged origin costs one live
+thread at a time and one in-flight request, no matter how many scrapes arrive.
 
 ### Configuration is validated at boot, not at first scrape
 

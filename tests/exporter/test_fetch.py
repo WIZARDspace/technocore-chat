@@ -512,3 +512,27 @@ def test_the_budget_holds_even_if_the_socket_cannot_be_re_armed(monkeypatch):
     # One overshoot is the documented cost of losing the re-arm: the read in flight when
     # the deadline passes still carries the full socket timeout. Bounded, not unbounded.
     assert elapsed < 1.5, f"a 0.5s budget took {elapsed:.2f}s with no re-arm"
+
+
+def test_a_deeply_nested_body_is_reported_not_raised_raw():
+    """The fourth family to escape as itself, and the first that is not socket-shaped.
+
+    `json.loads` raises `RecursionError` on a deeply nested document — 40KB of `[` does it,
+    two orders of magnitude under MAX_BODY_BYTES — and it is a `RuntimeError`, so neither
+    the `ValueError` handler nor the trailing `OSError` one reaches it. It escaped
+    `fetch_stats`, which left the collector's broad handler to log it as an *unexpected*
+    error with a traceback, rather than as the named refusal every other unusable body gets.
+
+    The body is reachable by anything that can occupy the configured address, which is the
+    same argument MAX_BODY_BYTES is there for.
+    """
+    depth = 20_000
+    body = (b"[" * depth) + (b"]" * depth)
+
+    def nested(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+        conn.sendall(body)
+
+    port = _raw_origin(nested)
+    with pytest.raises(StatsUnavailableError, match="nested too deeply"):
+        fetch_stats(f"http://127.0.0.1:{port}/stats", "token", timeout=5.0)

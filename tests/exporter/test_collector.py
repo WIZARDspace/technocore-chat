@@ -6,6 +6,7 @@ metric is worse than one that ships nothing, because an alert gets written again
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -432,3 +433,289 @@ def test_a_scrape_that_never_wins_the_lock_still_reports_inside_the_budget():
     assert _value(families, "technocore_exporter_scrape_success") == 0
     assert _value(families, "technocore_exporter_scrapes_total", "error") == 1
     assert elapsed < 1.0, f"a 0.5s budget took {elapsed:.2f}s waiting for the lock"
+
+
+def _trickling_header_origin(seconds=4.0, every=0.5):
+    """An origin that sends a status line and then header bytes, slowly. Returns its port.
+
+    The half of the trickle the body-read fix does not reach: `http.client` reads the status
+    line and headers inside `urlopen`, under the per-socket-operation timeout, so a byte
+    every 0.5s under a 1.0s budget never trips anything. It stops after `seconds` rather
+    than running forever, for the reason the body-trickle test gives: without the fix this
+    has to fail rather than wedge CI.
+
+    `every` must stay comfortably under the caller's budget — that is the whole mechanism.
+    A gap wider than the budget is trapped by the per-socket timeout like any other slow
+    read, and demonstrates nothing.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    connections = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:  # pragma: no cover - the test finished first
+                return
+            connections.append(conn)
+            threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+
+    def trickle(conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\n")
+            # A header line that never reaches the blank line ending the headers.
+            pad = b"X-Padding: " + b"a" * 4096 + b"\r\n"
+            started = time.monotonic()
+            i = 0
+            while time.monotonic() - started < seconds:
+                conn.sendall(pad[i % len(pad) : i % len(pad) + 1])
+                i += 1
+                time.sleep(every)
+        except OSError:  # pragma: no cover - the scrape gave up first, which is the point
+            pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1], connections
+
+
+def test_a_trickling_header_cannot_outrun_the_budget():
+    """The body deadline guards the body. Headers are read before it ever runs.
+
+    `_read_within` bounds `response.read1`, but `urlopen` has already returned by then —
+    `http.client` consumed the status line and every header under the per-socket timeout,
+    which one byte per 0.5s never trips. Measured at 22.6s of a 3s budget at `/metrics`,
+    and it was still going when the origin gave up rather than the exporter.
+
+    This is the one of the three that needs no hostname: it lands on the shipped
+    `127.0.0.1` default, because it is about what the origin sends rather than how it is
+    addressed.
+    """
+    port, _ = _trickling_header_origin()
+    collector = TechnocoreCollector(f"http://127.0.0.1:{port}/stats", "token", timeout=1.0)
+    started = time.monotonic()
+    families = list(collector.collect())
+    elapsed = time.monotonic() - started
+    assert _value(families, "technocore_exporter_scrape_success") == 0
+    assert elapsed < 1.5, f"a 1.0s budget took {elapsed:.2f}s reading headers"
+
+
+def test_a_wedged_resolver_cannot_outrun_the_budget(monkeypatch):
+    """Reported by @Minh3132 on `0deacdf`.
+
+    `socket.create_connection` calls `getaddrinfo()` before it has a socket for
+    `urlopen(timeout=)` to apply to, so name resolution is outside every bound this package
+    had. Measured at 20.0s of a 3s budget at `/metrics`, with no sample stored by
+    Prometheus at all: past `scrape_timeout: 15s`, the failure telemetry arrives after
+    nobody is listening for it.
+
+    The resolver is stubbed rather than pointed at a real wedged one because a test cannot
+    depend on the host's DNS being broken in a particular way; what it blocks in is real
+    time, on the thread CPython would really block.
+    """
+    real = socket.getaddrinfo
+
+    def wedged(host, *args, **kwargs):
+        if host == "origin.invalid":
+            time.sleep(4.0)
+            raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+        return real(host, *args, **kwargs)  # pragma: no cover - only the stub host is used
+
+    monkeypatch.setattr(socket, "getaddrinfo", wedged)
+    collector = TechnocoreCollector("http://origin.invalid:8080/stats", "token", timeout=1.0)
+    started = time.monotonic()
+    families = list(collector.collect())
+    elapsed = time.monotonic() - started
+    assert _value(families, "technocore_exporter_scrape_success") == 0
+    assert elapsed < 1.5, f"a 1.0s budget took {elapsed:.2f}s resolving"
+
+
+def test_every_address_of_a_name_cannot_each_spend_the_whole_budget(monkeypatch):
+    """`create_connection` tries every address a name resolved to, with the full timeout each.
+
+    So the budget is spent once per address record, not once per scrape: four blackholed A
+    records cost 12.0s of a 3s budget, each connect logged with the whole 3.0s rather than
+    a share. Two records is enough to break the shipped arithmetic, provided both blackhole
+    rather than refuse — a refusal returns at once, a dropping firewall does not. At the
+    accepted ceiling of just under 10s, two such addresses reach ~20s against
+    `scrape_timeout: 15s`.
+
+    Connect is stubbed because no address is portably guaranteed to blackhole rather than
+    refuse in CI. What is *not* stubbed is the part being pinned: the addresses come out of
+    the real `create_connection` loop, and the timeout recorded on each socket is the one it
+    really set. The assertion on `attempts` is that fact; the assertion on elapsed is that
+    the collector no longer pays for it.
+    """
+    addresses = [f"198.51.100.{n}" for n in (1, 2, 3, 4)]
+    attempts = []
+
+    def resolves_to_all(host, port, *args, **kwargs):
+        assert host == "origin.invalid"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in addresses]
+
+    def blackhole(self, address):
+        attempts.append((address[0], self.gettimeout()))
+        time.sleep(self.gettimeout())
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolves_to_all)
+    monkeypatch.setattr(socket.socket, "connect", blackhole)
+    collector = TechnocoreCollector("http://origin.invalid:8080/stats", "token", timeout=0.5)
+    started = time.monotonic()
+    families = list(collector.collect())
+    elapsed = time.monotonic() - started
+    assert _value(families, "technocore_exporter_scrape_success") == 0
+    assert elapsed < 1.0, f"a 0.5s budget took {elapsed:.2f}s connecting"
+    # Wait for the abandoned worker to walk the rest of the addresses, polling the fact
+    # rather than sleeping a guessed duration: a fixed sleep that expires early lets
+    # monkeypatch restore the real `connect`, and the worker then makes a genuine outbound
+    # attempt to a TEST-NET address from CI.
+    until = time.monotonic() + 10.0
+    while len(attempts) < len(addresses) and time.monotonic() < until:
+        time.sleep(0.02)
+    # What CPython actually did with the budget: every address, each with the whole of what
+    # was left of it rather than a share — which is what makes four addresses cost four.
+    assert [ip for ip, _ in attempts] == addresses
+    assert min(timeout for _, timeout in attempts) > 0.45, (
+        f"expected the whole budget on each address, got {attempts}"
+    )
+
+
+def test_an_abandoned_fetch_keeps_the_lock_so_no_second_request_is_opened():
+    """The thread bound, stated as a property rather than left to the reader.
+
+    `_fetching` is released by the worker, not by the scrape that started it. A scrape that
+    abandons a wedged fetch therefore leaves the lock held, and every later scrape fails on
+    the bounded acquire instead of opening a second request to an origin that has not
+    answered the first. Without that, a wedged origin would collect one live thread and one
+    in-flight request per scrape, for as long as it stayed wedged.
+
+    This guards the fix's own hazard rather than a pre-existing bug, so it is written
+    against a blocker the worker cannot escape on its own: the trickling headers, which are
+    outside every timeout `fetch_stats` can set. An origin that merely hangs is no good
+    here — the worker's socket timeout fires at about the same instant the scrape abandons
+    it, and the lock is then released a few microseconds either side of the assertion.
+    """
+    port, connections = _trickling_header_origin(seconds=3.0, every=0.1)
+    collector = TechnocoreCollector(f"http://127.0.0.1:{port}/stats", "token", timeout=0.3)
+    for _ in range(5):
+        families = list(collector.collect())
+        assert _value(families, "technocore_exporter_scrape_success") == 0
+    # Counted at the origin rather than as live threads. A thread count is a count over the
+    # whole process, and the other tests in this file deliberately leave wedged fetches
+    # behind them — so it measures the neighbours, not this collector. Connections accepted
+    # by *this* origin are the invariant in the docstring, stated directly.
+    assert len(connections) == 1, f"five scrapes opened {len(connections)} requests"
+    assert collector._fetching.locked(), "the abandoned fetch released the lock"
+
+
+def test_a_fetch_thread_that_cannot_start_does_not_strand_the_lock(monkeypatch):
+    """The one path where the worker cannot be the one to release `_fetching`.
+
+    Handing the release to the worker is what bounds a wedged origin to a single in-flight
+    request. It also means that if the thread never starts — `RuntimeError: can't start new
+    thread`, which is what thread exhaustion looks like — nobody releases, and a collector
+    that cannot take its own lock answers *every* later scrape with the queued-behind
+    failure, permanently, from one transient failure to spawn.
+    """
+
+    def cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", cannot_start)
+    collector = TechnocoreCollector("http://origin.invalid/stats", "token", timeout=1.0)
+    families = list(collector.collect())
+    assert _value(families, "technocore_exporter_scrape_success") == 0
+    assert not collector._fetching.locked(), "a failed spawn stranded the fetch lock"
+
+
+def test_an_abandoned_fetch_still_reports_what_the_origin_finally_did(caplog, monkeypatch):
+    """Running the fetch on a worker takes the transport's real reason out of the log.
+
+    The scrape answers at the deadline with "exceeded the scrape budget", which says the
+    answer was late but not *why* — and the worker that eventually learns the reason has no
+    one left to tell. Inline, `_failed` put `unreachable: [Errno -3] Temporary failure in
+    name resolution` in front of the operator. That is a diagnostic this change would
+    otherwise have removed, so the worker logs it once it knows.
+    """
+    real = socket.getaddrinfo
+
+    def wedged(host, *args, **kwargs):
+        if host == "origin.invalid":
+            time.sleep(1.0)
+            raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+        return real(host, *args, **kwargs)  # pragma: no cover - only the stub host is used
+
+    monkeypatch.setattr(socket, "getaddrinfo", wedged)
+    collector = TechnocoreCollector("http://origin.invalid:8080/stats", "token", timeout=0.2)
+    with caplog.at_level("WARNING", logger="technocore_exporter"):
+        families = list(collector.collect())
+        assert _value(families, "technocore_exporter_scrape_success") == 0
+        # The scrape is already back; wait for the worker to reach its own conclusion.
+        # Waited out inside the patch rather than after it, so the worker never sees the
+        # real resolver restored underneath it.
+        until = time.monotonic() + 10.0
+        while collector._fetching.locked() and time.monotonic() < until:
+            time.sleep(0.02)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("after the budget" in m and "name resolution" in m for m in messages), messages
+
+
+def test_an_origin_that_answers_late_is_still_an_error_not_a_discarded_digest(caplog, monkeypatch):
+    """An abandoned worker cannot come back with a usable digest, and that is worth pinning.
+
+    `fetch_stats` is handed the same deadline the scrape waits on, so a worker that outran
+    the scrape has outrun its own budget too: `_read_within` refuses before the body is
+    returned. That is why the abandoned-worker log has one arm rather than two, and it is
+    the kind of claim that rots silently — a later change giving the fetch its own longer
+    budget would make a late success reachable, and this test is what would notice.
+
+    The origin here is entirely healthy. Only the resolution is slow, and it is slow in the
+    one phase `fetch_stats` cannot bound for itself, so the fetch really does go on to
+    connect and read a valid digest before the deadline check refuses it.
+    """
+    body = json.dumps({"rooms": {}, "bytes": {}, "notes": {}, "counters": {}}).encode()
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+            conn.sendall(body)
+            conn.close()
+        except OSError:  # pragma: no cover - the test finished first
+            pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    port = listener.getsockname()[1]
+    real = socket.getaddrinfo
+
+    def slow_then_fine(host, requested_port, *args, **kwargs):
+        if host == "origin.invalid":
+            time.sleep(0.8)
+            return real("127.0.0.1", port, *args, **kwargs)
+        return real(host, requested_port, *args, **kwargs)  # pragma: no cover - stub only
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_then_fine)
+    collector = TechnocoreCollector("http://origin.invalid:8080/stats", "token", timeout=0.2)
+    with caplog.at_level("WARNING", logger="technocore_exporter"):
+        families = list(collector.collect())
+        assert _value(families, "technocore_exporter_scrape_success") == 0
+        until = time.monotonic() + 10.0
+        while collector._fetching.locked() and time.monotonic() < until:
+            time.sleep(0.02)
+    assert not collector._fetching.locked(), "the worker never finished"
+    late = [
+        record.getMessage()
+        for record in caplog.records
+        if "origin.invalid" in record.getMessage() and "after the budget" in record.getMessage()
+    ]
+    assert late, [record.getMessage() for record in caplog.records]
+    assert "exceeded the scrape budget while reading" in late[0], late
+    assert "answer discarded" not in late[0], late

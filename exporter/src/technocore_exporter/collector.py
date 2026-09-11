@@ -214,6 +214,10 @@ class TechnocoreCollector(Collector):
         # @Minh3132 and @yukkie3276). `_gather` bounds the wait and the fetch against one
         # deadline instead, so a queued scrape reports failure inside the budget rather than
         # succeeding after nobody is listening.
+        #
+        # `_fetching` is released by the fetch worker, never by the scrape that started it —
+        # see `_fetch_within`. That is what lets a scrape abandon a wedged fetch without
+        # letting the next one open a second request to the same origin.
         self._fetching = threading.Lock()
         self._state = threading.Lock()
 
@@ -231,8 +235,10 @@ class TechnocoreCollector(Collector):
         families inside the guard is what makes "no failure escapes" true of the mapping
         as well as the transport.
 
-        One deadline covers everything after `started`, waiting for the fetch lock
-        included. That is what makes the ceiling in server.py an actual bound: whatever
+        One deadline covers everything after `started`: the wait for the fetch lock, and
+        then the fetch itself in every phase of it — resolution, connect, headers and body
+        — because `_fetch_within` stops waiting at the deadline rather than trusting the
+        transport to. That is what makes the ceiling in server.py an actual bound: whatever
         else happens, this returns within the configured source timeout, so the failure it
         reports arrives while Prometheus is still listening for it.
         """
@@ -244,13 +250,7 @@ class TechnocoreCollector(Collector):
             # in, and an answer after the scrape timeout is worth less than a fast 0.
             return self._failed(started, "timed out waiting for the in-flight scrape")
         try:
-            # Clamped rather than checked for exhaustion: a scrape that wins the lock with
-            # nothing left gets a zero timeout, which is a non-blocking socket, which fails
-            # immediately and is published as scrape_success 0 inside the budget — the same
-            # answer an explicit branch here would produce, without a branch that only the
-            # clock can reach and no test can honestly cover.
-            remaining = max(0.0, deadline - time.monotonic())
-            payload = fetch_stats(self._url, self._token, remaining)
+            payload = self._fetch_within(deadline)
             families = [
                 *_rooms(payload.get("rooms", {})),
                 *_capacity(payload),
@@ -271,12 +271,97 @@ class TechnocoreCollector(Collector):
             # assumption that any such list is complete has been wrong three times.
             log.exception("unexpected error reading %s", self._url)
             return self._failed(started, None)
-        finally:
-            self._fetching.release()
         with self._state:
             self._scrapes["success"] += 1
             self._last_success = time.time()
         return families + list(self._self_metrics(time.monotonic() - started, ok=True))
+
+    def _fetch_within(self, deadline: float) -> dict:
+        """The digest, or refuse at the deadline — whatever the transport is doing.
+
+        `fetch_stats` bounds itself, and for the phase it can see it does so correctly. It
+        cannot see the others. `urlopen(timeout=)` is a *per socket operation* timeout, and
+        three phases run before the body read that `_read_within` guards:
+
+          * name resolution. `socket.create_connection` calls `getaddrinfo()` before it has
+            a socket for the timeout to apply to, so a wedged resolver blocks the whole
+            call — 20.0s of a 3s budget, measured at /metrics (reported by @Minh3132);
+          * connect. That same function then tries *every* address the name resolved to,
+            giving each the full timeout, so a hostname with four blackholed A records cost
+            12.0s of a 3s budget, four times the budget for four records; and
+          * the status line and response headers, read by `http.client` before `open()`
+            returns. An origin trickling one header byte per 0.5s never trips a 3s socket
+            timeout: 22.6s, still waiting when the origin stopped. This one needs no
+            hostname at all — it lands on the shipped `127.0.0.1` default.
+
+        Enumerating those three and bounding each is the move this file has already been
+        wrong about three times over (see the broad handler in `_gather` and the trailing
+        `OSError` in fetch.py). So the bound here is structural: the fetch runs on a worker
+        and the scrape stops waiting at the deadline, whatever the worker is blocked on.
+
+        The lock is the reason this is safe rather than a thread leak. `_fetching` is
+        already held when we get here, and the *worker* releases it — so an abandoned fetch
+        keeps it, the next scrape's bounded `acquire` fails fast and reports
+        `scrape_success 0` inside its own budget, and no second request is ever opened to an
+        origin that has not answered the first. One wedged origin therefore costs one live
+        thread at a time, not one per scrape.
+        """
+        # Clamped rather than checked for exhaustion: a scrape that wins the lock with
+        # nothing left gets a zero timeout, which is a non-blocking socket, which fails
+        # immediately and is published as scrape_success 0 inside the budget — the same
+        # answer an explicit branch here would produce, without a branch that only the
+        # clock can reach and no test can honestly cover.
+        remaining = max(0.0, deadline - time.monotonic())
+        box: dict = {}
+        done = threading.Event()
+        abandoned = threading.Event()
+
+        def run() -> None:
+            try:
+                box["payload"] = fetch_stats(self._url, self._token, remaining)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the scrape's thread
+                # Re-raised below rather than handled, so `_gather`'s existing handlers see
+                # exactly what they saw when the fetch ran inline.
+                box["error"] = exc
+            finally:
+                # Before `done`, so a scrape that wakes on it finds the lock already free.
+                self._fetching.release()
+                done.set()
+                if abandoned.is_set():
+                    # The scrape that started this has already answered, so nothing above
+                    # will ever look at `box`. Without this the origin's real reason is
+                    # lost: the operator gets "exceeded the scrape budget", which says the
+                    # answer was late but not that the resolver was down. Running the fetch
+                    # inline used to put that reason in the log, and it should still.
+                    #
+                    # Always an error, never a discarded digest. `fetch_stats` is given
+                    # this same deadline, so a worker that outran the scrape has outrun its
+                    # own budget too and `_read_within` refuses before it returns a body.
+                    # The default below is defensive, not a case that happens.
+                    log.warning(
+                        "scrape of %s finished after the budget: %s",
+                        self._url,
+                        box.get("error", "answer discarded"),
+                    )
+
+        worker = threading.Thread(target=run, name="technocore-exporter-fetch", daemon=True)
+        try:
+            worker.start()
+        except BaseException:
+            # Nothing will release `_fetching` if the worker never ran, and a collector
+            # that can no longer take its own lock answers every later scrape with the
+            # queued-behind failure forever.
+            self._fetching.release()
+            raise
+        if not done.wait(max(0.0, deadline - time.monotonic())):
+            # Set before raising, so the worker knows nobody is left to report what it
+            # finds. A worker that finishes inside this window sees it unset and stays
+            # quiet, which is right: the scrape below is about to report for it.
+            abandoned.set()
+            raise StatsUnavailableError("exceeded the scrape budget before the origin answered")
+        if "error" in box:
+            raise box["error"]
+        return box["payload"]
 
     def _failed(self, started: float, reason: str | None) -> list:
         """Failure telemetry alone, and the count that goes with it.

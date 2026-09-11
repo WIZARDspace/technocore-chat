@@ -27,10 +27,12 @@ import urllib.request
 # scrape with telemetry rather than as a scrape timeout with no samples at all — the
 # second says nothing about which side is unwell.
 #
-# This is a budget for the whole call, not a socket option. `urlopen(timeout=)` bounds each
-# individual socket operation, so an origin that trickles a byte at a time never trips it:
-# measured at 20.01s for one fetch on this default, with no concurrency at all. The
-# deadline in `_read_within` is what makes the figure above mean what this comment says.
+# This is a budget for the whole scrape, not a socket option. `urlopen(timeout=)` bounds
+# each individual socket operation, so an origin that trickles a byte at a time never trips
+# it: measured at 20.01s for one fetch on this default, with no concurrency at all. The
+# deadline in `_read_within` bounds the body against that, and
+# `TechnocoreCollector._fetch_within` bounds the phases this file cannot see — resolution,
+# connect, and the header read. It takes both for the figure above to mean what it says.
 DEFAULT_TIMEOUT = 5.0
 
 # One `recv` worth of body per iteration of the read loop. `read1` is deliberate: `read`
@@ -193,10 +195,15 @@ def _read_within(response, deadline: float, limit: int) -> bytes:
 def fetch_stats(url: str, token: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
     """Read and validate the JSON digest. Raises StatsUnavailableError for anything else.
 
-    `timeout` is the budget for this whole call — connect, headers and body together —
-    rather than the per-socket-operation timeout `urlopen` understands by itself. The
-    collector's guarantee that a slow origin reports `scrape_success 0` before Prometheus
-    abandons the scrape is only true if this returns within it.
+    `timeout` bounds the body read as a whole — see `_read_within` — rather than as the
+    per-socket-operation timeout `urlopen` understands by itself. It does NOT bound the
+    phases before that: `getaddrinfo` runs before there is a socket to apply it to, connect
+    spends it again on every address a name resolved to, and `http.client` reads the status
+    line and headers under it per operation, so a trickle of header bytes never trips it.
+    Those are bounded a level up, by `TechnocoreCollector._fetch_within`, which stops
+    waiting at the deadline whatever the transport is doing. The collector's guarantee that
+    a slow origin reports `scrape_success 0` before Prometheus abandons the scrape rests on
+    that, not on this.
 
     The token rides in `X-Stats-Token`, never in the URL: a query parameter would land in
     the proxy logs and in the exporter's own error text, and the service does not accept
@@ -246,6 +253,13 @@ def fetch_stats(url: str, token: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         # The handlers above still run first and still carry the better message; this one
         # only has to make sure nothing socket-shaped leaves as itself.
         raise StatsUnavailableError(f"transport error: {type(exc).__name__}") from None
+    except RecursionError:
+        # Not socket-shaped, so the OSError above does not reach it, and not a ValueError
+        # either: `json.loads` raises this on a deeply nested document, and 40KB of `[`
+        # is enough — two orders of magnitude under MAX_BODY_BYTES. It escaped as itself,
+        # which left the collector's broad handler to log it as an unexpected error with a
+        # traceback rather than as the named refusal every other bad body gets.
+        raise StatsUnavailableError("response nested too deeply to parse") from None
     except ValueError:
         raise StatsUnavailableError("response was not JSON") from None
     if not isinstance(payload, dict):
