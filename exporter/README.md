@@ -108,8 +108,27 @@ but `increase()` across that window undercounts rather than showing a gap.
 Exporter self-metrics: `technocore_exporter_scrape_success`,
 `technocore_exporter_scrape_duration_seconds`,
 `technocore_exporter_last_success_timestamp_seconds`,
-`technocore_exporter_scrapes_total{outcome="success"|"error"}`. Alert on these first —
-without them a wrong token and a service with no rooms are the same absence of samples.
+`technocore_exporter_scrapes_total{outcome="success"|"error"}`. Without them a wrong token
+and a service with no rooms are the same absence of samples.
+
+#### These do not replace Prometheus's own `up`
+
+Alert on both, and on `up` first. Prometheus synthesizes `up` per scrape, and it answers a
+question the exporter structurally cannot: whether the page arrived at all. Measured
+against Prometheus 3.5.0:
+
+| what happened | `up` | `technocore_exporter_scrape_success` |
+|---|---|---|
+| exporter answers slower than `scrape_timeout` | `0` | no samples stored |
+| exporter is gone | `0` | no samples stored |
+| exporter answering, `/stats` read failing | `1` | `0` |
+
+So `up` covers the whole "we never got the page" half, including the slow case — an
+exporter that eventually answers past the scrape timeout stores nothing of its own no
+matter what it believed it was reporting. The self-metrics uniquely carry the last row,
+where the exporter is healthy and the read behind it is not; a wrong `CHAT_STATS_TOKEN` is
+the common cause and `/stats` answers it with 404, so nothing about it looks like an
+authentication failure. `config/technocore-alerts.yml` ships one alert for each half.
 
 ### Why the room classes are two different shapes
 
@@ -184,9 +203,10 @@ promtool check rules exporter/config/technocore-alerts.yml
 ```
 
 `test rules` is the one that matters of the two: `check rules` only says the file parses,
-while `test rules` unit-tests both alerts in both directions — including the exactly-85%
-boundary that must *not* fire, and the `absent()` case a bare `== 0` rule would miss. It
-runs from `exporter/config` because the test file names its rule file relatively.
+while `test rules` unit-tests all three alerts in both directions — the exactly-85%
+capacity boundary that must *not* fire, one exporter of two going down, a scrape slower
+than `scrape_timeout`, a healthy pair staying quiet, and nothing scraping the job at all.
+It runs from `exporter/config` because the test file names its rule file relatively.
 
 The suite validates the exposition through the client library's own parser on every run, so
 `promtool` is a second opinion rather than the only one.
