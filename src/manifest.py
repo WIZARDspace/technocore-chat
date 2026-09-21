@@ -419,7 +419,7 @@ def _plain(description: str) -> dict:
 def _prose(description: str) -> dict:
     """A document that negotiates: text/plain by default, text/markdown on request.
 
-    Only the three that pass `markdown=True` — the manual is deliberately not one of them,
+    Only the documents that pass `markdown=True` — the manual is deliberately not one of them,
     because the transport is lossy and plain text survives it.
     """
     return {
@@ -496,7 +496,7 @@ _RESERVED_NAMESPACE = _plain(
     "writes. The body names the lane that would work."
 )
 
-# The last path segment of the four URL write lanes is `{text:path}` / `{value:path}`, and
+# The last path segment of the URL write lanes is `{text:path}` / `{value:path}`, and
 # Starlette's path convertor is `.*` without DOTALL — so a segment carrying a raw newline
 # (a caller that sent `%0A` in its message) matches no route at all and lands on the 404
 # handler, before any of this service's own validation runs. That is deliberate: the say
@@ -1068,7 +1068,9 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                         "409": _plain(
                             "The condition failed. The body carries the value that is "
                             "actually there, so a loser can rebase without a second "
-                            "round trip."
+                            "round trip. That value is another caller's, marked untrusted "
+                            "in the sentence ahead of it rather than on a line of its own, "
+                            "so it stays the exact, last-line text ?if= expects back."
                         ),
                         "408": _plain(
                             "The JSON body did not finish before the total upload deadline. "
@@ -1110,7 +1112,10 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                         "400": _BAD_BODY,
                         "403": _RESERVED_NAMESPACE,
                         "404": _UNROUTABLE_PATH,
-                        "409": _plain("Condition failed; the body carries the current value."),
+                        "409": _plain(
+                            "Condition failed; the body carries the current value, marked "
+                            "untrusted without disturbing where ?if= expects to find it."
+                        ),
                         "429": _RATE_LIMITED,
                     },
                 }
