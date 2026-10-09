@@ -18,12 +18,17 @@ job then posts a notice that is already false. Re-reading *before* the write onl
 that window; the reconcile has to come after the write, because the write is what makes the
 stale notice exist.
 
-Both are pinned structurally rather than behaviourally, and that limit is worth stating: no
-JavaScript runs in this suite. `tests/package.json` is Playwright for the browser gate and
-says so, and `tests/edge/test_edge_worker.py` -- the one other test whose subject is
-JavaScript -- also asserts agreement by parsing rather than by executing. An executable
-regression would mean a Node runner and a `github-script` shim, which is a larger change
-than the workflow it would be testing.
+Those two are pinned structurally. The third is not, because it was found by running the
+scripts: the notice is one comment shared by every head of the PR, so an older head's job
+-- its post-write cleanup, or ci-not-run-clear for its completed run -- could delete the
+notice a newer, still-gated head had just written. That is an interleaving of two jobs, and
+no assertion about one script's text can see it, so `tests/queue_guard_ci_notice.mjs`
+executes both scripts unchanged against an in-memory GitHub API and replays it. A job now
+removes its own head's notice, or another head's only while its head is still the PR's;
+the second half is replayed too, because without it a notice an older head left is
+stranded once the current head runs. The fixture needs only `node` (no npm install;
+`tests/package.json` stays Playwright's) and is skipped without one, except under CI, where
+a missing Node is a failure rather than a pass. Raised by @renhi and @luch91.
 
 Parsed with a regex rather than a YAML library, for the reason
 `tests/unit/test_browser_gate.py` gives: PyYAML is here only as somebody else's transitive
@@ -34,11 +39,18 @@ Run: uv run --group dev python -m pytest tests/unit/test_queue_guard_ci_notice.p
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "queue-guard.yml"
+FIXTURE = ROOT / "tests" / "queue_guard_ci_notice.mjs"
 
 # The `ci-not-run` job's inline script, up to the next job at the same indentation.
 # `ci-not-run-clear` is a separate lifecycle with its own rules and must not be caught here.
@@ -96,3 +108,59 @@ def test_the_gated_path_rechecks_the_run_after_it_writes():
         "the post-write re-read reaches no delete, so it observes the stale notice "
         "and leaves it in place"
     )
+
+
+@pytest.fixture(scope="module")
+def replayed() -> dict[str, str | None]:
+    node = shutil.which("node")
+    if node is None:
+        if os.environ.get("CI"):
+            pytest.fail("node is not on PATH; the ci-not-run interleavings did not run")
+        pytest.skip("node is not on PATH")
+    out = subprocess.run([node, str(FIXTURE)], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_the_lifecycle_still_posts_and_clears(replayed):
+    """Controls, so the race tests below cannot pass by a fixture that never posts."""
+    assert replayed["gated_posts"] == "aaa", "a gated head gets a notice naming it"
+    assert replayed["approval_clears"] is None, "a completed run clears its head's notice"
+    assert replayed["ran_head_clears_its_own"] is None, "a head seen running clears its own"
+
+
+def test_an_older_heads_cleanup_leaves_a_newer_heads_notice(replayed):
+    """Head A's job posts, the PR moves to B and B's job posts, then A's run leaves
+    `action_required` and A's post-write re-read sees it. Deleting there removed B's
+    warning while B was still gated, and nothing would put it back."""
+    assert replayed["older_cleanup_after_newer_write"] == "bbb"
+
+
+def test_clearing_an_older_heads_run_leaves_a_newer_heads_notice(replayed):
+    """The same race through ci-not-run-clear, which sits outside the posting job's
+    concurrency group: its open-PR list can still show head A when A's run completes."""
+    assert replayed["clear_for_older_head_after_newer_write"] == "bbb"
+
+
+def test_a_newer_heads_run_clears_a_notice_an_older_head_left(replayed):
+    """The other side of head identity. A synchronize whose run has not surfaced within the
+    poll leaves the previous head's notice standing, by the 'unknown' rule; once the PR's
+    current head has run, that notice is false and must go. A rule of "only ever your own
+    head's notice" stranded it for good, through both jobs."""
+    assert replayed["newer_head_run_clears_an_older_heads_notice"] is None
+    assert replayed["newer_head_seen_running_clears_an_older_heads_notice"] is None
+
+
+def test_posting_jobs_are_serialised_per_pr():
+    """Head identity stops a wrong delete; the concurrency group stops two posting jobs
+    reading and writing the same comment at once, which head identity alone narrows but
+    does not close (a list, then a newer head's update, then a delete by id)."""
+    job = _JOB.search(WORKFLOW.read_text(encoding="utf-8"))
+    assert job
+    assert re.search(
+        r"^    concurrency:\n"
+        r"      group: queue-guard-ci-not-run-\$\{\{ github\.event\.pull_request\.number \}\}\n"
+        r"      cancel-in-progress: false\n",
+        job.group(1),
+        re.M,
+    ), "ci-not-run is no longer serialised per pull request"

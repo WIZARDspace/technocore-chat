@@ -112,6 +112,15 @@ jobs:
     if: >-
       github.event.action == 'opened' || github.event.action == 'reopened'
       || github.event.action == 'synchronize'
+    # One posting job per PR at a time. Two pushes in quick succession otherwise run two of
+    # these side by side, and the older head's post-write cleanup can land after the newer
+    # head's write -- deleting the notice for a head that is still gated. Not
+    # cancel-in-progress: the running job finishes its write-then-reconcile before the next
+    # head's starts, and a newer pending job already replaces an older pending one. Raised
+    # by @renhi and @luch91 on #735.
+    concurrency:
+      group: queue-guard-ci-not-run-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       # Narrower than the workflow default: this job reads run state and writes one
@@ -128,6 +137,18 @@ jobs:
             const pr = context.payload.pull_request;
             if (pr.head.repo && pr.head.repo.full_name === pr.base.repo.full_name) return;
             const marker = '<!-- queue-guard-ci-not-run -->';
+            // The notice names the head it is about, and that decides who may remove it: this
+            // job may remove its own head's notice, and another head's only while this head is
+            // still the PR's head -- then the notice is about a commit the PR has left. So an
+            // older head's late observation (its run approved, superseded, or read after the
+            // next push) cannot take down the warning for a newer head that is still gated,
+            // and a notice left by an older head is still cleared once the current head runs.
+            // The PR is re-read for this rather than trusted from the event payload, which
+            // is as old as the job.
+            const head = '<!-- head: ' + pr.head.sha + ' -->';
+            const removable = async c => c.body.includes(head)
+              || (await github.rest.pulls.get({ ...context.repo, pull_number: pr.number }))
+                .data.head.sha === pr.head.sha;
             // `pull_request` and `pull_request_target` dispatch from the same push, so the
             // CI run may not be listed yet when this job reaches the API. Poll briefly
             // rather than reporting "never ran" against a run that is seconds from
@@ -168,14 +189,15 @@ jobs:
             if (state === 'ran') {
               // Upserted and removed by marker, like the overlap comment: once the run is
               // approved the notice is wrong, and a stale warning is its own bug.
-              if (mine) await github.rest.issues.deleteComment(
+              if (mine && await removable(mine)) await github.rest.issues.deleteComment(
                 { ...context.repo, comment_id: mine.id });
               return;
             }
-            const body = marker + '\nCI has not run on this head: the workflow run was ' +
-              'created as `action_required` and is waiting for a maintainer to approve ' +
-              'it. Until then the checks above do not mean the repo\'s gate passed — ' +
-              '`lint + tests + image` has not executed at all.\n\nThis is the default ' +
+            const body = marker + '\n' + head + '\nCI has not run on this head: the ' +
+              'workflow run was created as `action_required` and is waiting for a ' +
+              'maintainer to approve it. Until then the checks above do not mean the ' +
+              'repo\'s gate passed — `lint + tests + image` has not executed at all.' +
+              '\n\nThis is the default ' +
               '"require approval for first-time contributors" setting, not anything ' +
               'wrong with this pull request, and it clears once a maintainer releases ' +
               'the run (#693).';
@@ -199,7 +221,7 @@ jobs:
             const stale = fresh.find(
               c => c.user && c.user.type === 'Bot'
                 && c.body && c.body.startsWith(marker));
-            if (stale) await github.rest.issues.deleteComment(
+            if (stale && await removable(stale)) await github.rest.issues.deleteComment(
               { ...context.repo, comment_id: stale.id });
 
   ci-not-run-clear:
@@ -252,6 +274,12 @@ jobs:
                 && c.body && c.body.startsWith(marker));
             // Deleted whatever the run concluded, the gated case above excepted. A failed
             // run is still a run: the notice says CI has not executed, and once it has,
-            // that is false regardless of result.
-            if (mine) await github.rest.issues.deleteComment(
+            // that is false regardless of result. By ci-not-run's rule: this run's own
+            // head's notice, or any notice while this head is still the PR's head. The list
+            // above is a snapshot, and the PR may since have moved to a newer head whose
+            // notice is not this run's to clear.
+            const removable = async c => c.body.includes('<!-- head: ' + sha + ' -->')
+              || (await github.rest.pulls.get({ ...context.repo, pull_number: pr.number }))
+                .data.head.sha === sha;
+            if (mine && await removable(mine)) await github.rest.issues.deleteComment(
               { ...context.repo, comment_id: mine.id });
