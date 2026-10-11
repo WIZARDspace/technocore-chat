@@ -42,16 +42,16 @@ def test_startup_starts_the_reaper_thread_and_shutdown_stops_it(client, monkeypa
     """#896: each worker reaps from its own background thread, started with the app and told
     to stop with it, rather than from whichever request crosses the interval first."""
     import config
-    import store
+    import reaper
 
     seen, stopped = [], threading.Event()
 
-    def reaper(root, stop):
+    def fake_reaper(root, stop):
         seen.append((root, threading.current_thread() is threading.main_thread()))
         stop.wait(10)
         stopped.set()
 
-    monkeypatch.setattr(store, "_reap_forever", reaper)
+    monkeypatch.setattr(reaper, "_reap_forever", fake_reaper)
     with client:  # startup through shutdown, as in the test above
         deadline = time.monotonic() + 5
         while not seen and time.monotonic() < deadline:

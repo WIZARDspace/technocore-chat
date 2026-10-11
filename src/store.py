@@ -790,8 +790,8 @@ def _bump(root: Path, **deltas: int) -> None:
 
     What it costs: `.counters` lags by whatever is pending while the lock is contended
     (bounded by one holder's read-modify-replace, and caught up by the next bump), and a
-    worker killed hard loses its own unflushed batch — hard specifically, since app.py's
-    lifespan flushes this bucket on a graceful stop, which is what a rolling deploy sends. Both are the undercount this
+    worker killed hard loses its own unflushed batch — hard specifically, since
+    `reaper.lifespan` flushes this bucket on a graceful stop, which is what a rolling deploy sends. Both are the undercount this
     function's contract already allows — deeper by one flush than before, never wrong in
     the direction that matters, and never able to make a counter go backwards.
     """
@@ -1905,29 +1905,6 @@ def _reap(root: Path) -> None:
         return  # a pass is already running in another worker; nothing here waits for it
 
 
-def _reap_forever(root: Path, stop: threading.Event) -> None:
-    """Call `_reap` every REAP_EVERY until `stop` is set — the pass's only caller outside
-    tests, on a daemon thread each worker starts in app.py's lifespan (#896).
-
-    It used to run inline, before the write, in `_write_record` and `note_set`, so whichever
-    ordinary write crossed the interval first carried the whole walk: minutes on the live
-    store, past the edge's 100 s origin timeout, holding a request thread and contending with
-    request writes for `.counters.lock` (#588) the whole time. The marker's throttle and lock
-    are unchanged, so it is still one pass per REAP_EVERY across the service however many
-    workers wait here.
-
-    It waits before its first pass: a worker that has just started has no reason to walk the
-    store ahead of the throttle, and a test that starts the app gets no pass racing it. A
-    pass that raises is reported and the loop carries on — a dead reaper thread would stop
-    retirement for the life of the worker, where an inline failure only ever cost one write.
-    """
-    while not stop.wait(REAP_EVERY):
-        try:
-            _reap(root)
-        except Exception as error:  # noqa: BLE001 - the next interval retries; dying would not
-            config._dbg(0, "reap_failed", error=repr(error))  # level 0: always printed
-
-
 def _reap_pass(root: Path, now: float) -> None:
     """One pass, under the marker lock and past the throttle — see `_reap`, which owns both.
     `now` is that caller's instant, so every reapability decision in the pass is made against
@@ -2053,12 +2030,11 @@ def _snapshot(root: Path) -> None:
     """Append one aggregate sample, at most once per SNAPSHOT_EVERY, pruning past
     SNAPSHOT_KEEP_SECONDS.
 
-    Throttled off a marker's mtime exactly like `_reap`, and called from the same place, so
-    this service still has no background thread, no scheduler and no lifespan hook — the
-    two periodic jobs are both "whoever writes next, if it is due". The cost is one extra
-    directory walk per interval on a path that is already walking those directories to
-    reap, and it is what lets `/stats` answer a growth question with stored numbers rather
-    than the caller keeping its own history.
+    Throttled off a marker's mtime exactly like `_reap`, but still run by "whoever writes
+    next, if it is due" (`_write_record`, after the write): `_reap` moved to each worker's
+    reaper thread in `reaper.py` (#896), and this did not. The cost is one extra directory
+    walk per interval on that write, and it is what lets `/stats` answer a growth question
+    with stored numbers rather than the caller keeping its own history.
 
     A consequence worth naming: an idle service takes no samples. That is correct — with
     no writes there is no new traffic to record — but it means the newest sample can be

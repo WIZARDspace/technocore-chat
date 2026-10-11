@@ -870,6 +870,7 @@ def test_the_reaper_thread_waits_reaps_survives_a_failure_and_stops(tmp_path, mo
     its first pass, so a fresh worker or a test that starts the app is not raced by one; it
     keeps going through a pass that raises, because a dead reaper thread would stop retirement
     for the life of the worker; and it exits when told to."""
+    import reaper
     import store
 
     calls = []
@@ -884,7 +885,7 @@ def test_the_reaper_thread_waits_reaps_survives_a_failure_and_stops(tmp_path, mo
     def run(interval, until):
         monkeypatch.setattr(store, "REAP_EVERY", interval)
         stop = threading.Event()
-        worker = threading.Thread(target=store._reap_forever, args=(tmp_path, stop), daemon=True)
+        worker = threading.Thread(target=reaper._reap_forever, args=(tmp_path, stop), daemon=True)
         worker.start()
         deadline = time.monotonic() + 10
         while not until() and time.monotonic() < deadline:
