@@ -2269,7 +2269,10 @@ def manual_tokens(free_paths: str, max_wait: float) -> dict[str, str]:
         "__MAX_NOTES_NS__": str(store.MAX_NOTES_PER_NS),
         "__ROOM_BYTES_TOTAL__": fmt_bytes(store.MAX_TOTAL_ROOM_BYTES),
         "__ROOM_RING__": fmt_bytes(store.MAX_ROOM_BYTES),
-        "__ROOM_FLOOR__": fmt_bytes(store.RESERVED_ROOM_BYTES),
+        # Half, not RESERVED_ROOM_BYTES: under pressure that is the size at which the append
+        # path compacts, and it compacts to `limit // 2`: a room keeps its newest records that
+        # fit in half, never fewer than one (#990).
+        "__ROOM_FLOOR__": fmt_bytes(store.RESERVED_ROOM_BYTES // 2),
         "__NAME_RULE__": store.NAME_RE.pattern,
         "__MAX_TEXT__": str(store.MAX_TEXT_CHARS),
         "__MAX_VALUE__": str(store.MAX_VALUE_CHARS),
