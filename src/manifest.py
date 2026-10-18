@@ -466,12 +466,12 @@ def fmt_bytes(n: int) -> str:
 
     Two rules, both from what these numbers mean. It falls through to the next unit down
     rather than flooring to the larger one: RESERVED_ROOM_BYTES is the budget divided by
-    MAX_ROOMS, so raising CHAT_MAX_ROOMS pushes it under a MiB (512 KiB at 10240), and a
-    `>> 20` render published that guarantee as "0 MiB" — the opposite of the floor the
-    append path enforces. And it truncates rather than rounds, because a floor stated
-    larger than the one enforced is the same class of error: 1.969 MiB reads "1.9 MiB",
-    never "2.0 MiB". A value whole in its unit keeps no decimal, so a byte-exact cap does
-    not gain a misleading `.0`.
+    MAX_ROOMS, so raising CHAT_MAX_ROOMS pushes it under a MiB (512 KiB at 10240, which
+    publishes a 256 KiB floor), and a `>> 20` render printed such a figure as "0 MiB" —
+    the opposite of the floor the append path enforces. And it truncates rather than
+    rounds, because a floor stated larger than the one enforced is the same class of
+    error: 1.969 MiB reads "1.9 MiB", never "2.0 MiB". A value whole in its unit keeps no
+    decimal, so a byte-exact cap does not gain a misleading `.0`.
     """
     for unit, scale in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
         if n >= scale:
